@@ -496,6 +496,83 @@ def _safe_get(d, *keys, default=None):
     return default
 
 
+@st.cache_data(ttl=21600, show_spinner=False)
+def _fetch_twse_bwibbu_day(date_ymd):
+    """TWSE 本益比/殖利率/股價淨值比 日報 (所有上市)。"""
+    try:
+        url = "https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d"
+        params = {"date": date_ymd, "selectType": "ALL", "response": "json"}
+        headers = dict(_HTTP_HEADERS)
+        headers["Referer"] = "https://www.twse.com.tw/"
+        r = requests.get(url, params=params, timeout=8, headers=headers)
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        df = _df_from_any(j)
+        if df is None or df.empty:
+            return None
+        return df
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _fetch_tpex_bwibbu_day(date_roc):
+    """TPEX 上櫃本益比/殖利率/股價淨值比 日報 (ROC 日期)。"""
+    try:
+        url = "https://www.tpex.org.tw/www/zh-tw/afterTrading/peRatio"
+        params = {"date": date_roc, "id": "", "response": "json"}
+        headers = dict(_HTTP_HEADERS)
+        headers["Referer"] = "https://www.tpex.org.tw/"
+        r = requests.get(url, params=params, timeout=8, headers=headers)
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        df = _df_from_any(j)
+        if df is None or df.empty:
+            return None
+        return df
+    except Exception:
+        return None
+
+
+def _fetch_twse_valuation(stock_code, is_otc=False):
+    """從 TWSE/TPEX 抓最近 5 個交易日的本益比/P/B/殖利率,回傳第一筆找得到的。"""
+    code = str(stock_code).strip()
+    for dt in _recent_trading_dates(5):
+        if is_otc:
+            df = _fetch_tpex_bwibbu_day(_roc_date(dt))
+        else:
+            df = _fetch_twse_bwibbu_day(dt.strftime('%Y%m%d'))
+        if df is None or df.empty:
+            continue
+        row = _match_stock_row(df, code)
+        if row is None:
+            continue
+
+        def _f(col_keywords):
+            for col in row.index:
+                cs = str(col)
+                for kw in col_keywords:
+                    if kw in cs:
+                        v = str(row[col]).replace(',', '').strip()
+                        if v in ('', '-', '--', 'N/A'):
+                            return None
+                        try:
+                            return float(v)
+                        except Exception:
+                            return None
+            return None
+
+        return {
+            '本益比': _f(['本益比', '_per', 'P/E']),
+            '股價淨值比': _f(['股價淨值比', '_pbr', 'P/B']),
+            '殖利率': _f(['殖利率', '現金股利殖利率']),
+            '日期': dt,
+        }
+    return None
+
+
 def _pct_from_ratio(v):
     """yfinance 比例值可能為 0-1 (如 0.28) 或 0-100 (如 28);統一換成 %。"""
     if v is None:
@@ -507,9 +584,11 @@ def _pct_from_ratio(v):
 
 
 def get_fundamental_data(ticker_symbol):
-    """獲取並計算財務指標。以 ticker.info (TTM 指標) 為主要來源,
-    financials/balance_sheet 為補強。info 對台股幾乎一定有資料,
-    比 ticker.financials (常為空) 穩定得多。
+    """獲取財務指標。多層來源:
+      1. yfinance ticker.info (TTM 指標,美股+台股大部分能用)
+      2. TWSE/TPEX BWIBBU_d 日報 (台股官方本益比/P/B/殖利率,幾乎一定有)
+      3. 由 P/E + 股價反推 EPS
+    只要有 EPS 或 P/E 其中一個就會回傳資料,不再整個失敗。
     """
     try:
         ticker = yf.Ticker(ticker_symbol)
@@ -518,57 +597,92 @@ def get_fundamental_data(ticker_symbol):
         except Exception:
             info = {}
 
-        # 只要 info 有任一關鍵財務指標就繼續,不要求 financials
-        has_any = any([
-            info.get('trailingEps'),
-            info.get('forwardEps'),
-            info.get('bookValue'),
-            info.get('returnOnEquity'),
-            info.get('priceToBook'),
-            info.get('trailingPE'),
-            info.get('totalRevenue'),
-        ])
+        # 先取 info (可能為空)
+        eps_info = info.get('trailingEps') or info.get('forwardEps')
+        pe_info = info.get('trailingPE')
+        pb_info = info.get('priceToBook')
+        bvps_info = info.get('bookValue')
+        roe_info = info.get('returnOnEquity')
+        gm_info = info.get('grossMargins')
+        pm_info = info.get('profitMargins')
+        dy_info = info.get('dividendYield')
+        rg_info = info.get('revenueGrowth')
+        price = info.get('currentPrice') or info.get('regularMarketPrice')
+
+        # 對台股補強: 用 TWSE/TPEX 官方日報
+        twse_val = None
+        is_tw = ticker_symbol.endswith(('.TW', '.TWO'))
+        if is_tw:
+            stock_code = ticker_symbol.replace('.TW', '').replace('.TWO', '')
+            is_otc = ticker_symbol.endswith('.TWO')
+            twse_val = _fetch_twse_valuation(stock_code, is_otc=is_otc)
+            # 若 info 沒有股價,從最後一根 K 線拿
+            if not price:
+                try:
+                    hist = yf.Ticker(ticker_symbol).history(period='5d')
+                    hist = _clean_history(hist)
+                    if hist is not None and not hist.empty:
+                        price = float(hist.iloc[-1]['Close'])
+                except Exception:
+                    pass
+
+        # 合併 EPS / PE / PB (以 info 為主,TWSE 為備援)
+        pe = pe_info or (twse_val.get('本益比') if twse_val else None)
+        pb = pb_info or (twse_val.get('股價淨值比') if twse_val else None)
+        dy = dy_info
+        if (not dy or dy == 0) and twse_val and twse_val.get('殖利率'):
+            dy = twse_val['殖利率']  # TWSE 已經是 % (如 2.5)
+
+        # EPS 反推: 如果 info 沒給但有 PE+price,可以算出 EPS
+        eps = eps_info
+        if (not eps or eps == 0) and pe and pe > 0 and price:
+            eps = price / pe
+
+        # BVPS 反推
+        bvps = bvps_info
+        if (not bvps or bvps == 0) and pb and pb > 0 and price:
+            bvps = price / pb
+
+        # 至少要有 EPS 或 PE 才算有資料
+        has_any = any([eps, pe, pb, bvps, roe_info, gm_info, pm_info])
         if not has_any:
             return None
 
         metrics = {}
 
-        # 1. EPS (TTM) — 多層 fallback
-        eps = _safe_get(info, 'trailingEps', 'forwardEps', default=0) or 0
-        metrics['每股盈餘'] = eps
+        # 1. EPS (已 fallback: info → PE*price 反推)
+        metrics['每股盈餘'] = eps or 0
 
-        # 2. 每股淨值 (BVPS)
-        metrics['每股淨值'] = info.get('bookValue') or 0
+        # 2. 每股淨值 (BVPS) (已 fallback: info → PB*price 反推)
+        metrics['每股淨值'] = bvps or 0
 
         # 3. ROE
-        metrics['ROE'] = _pct_from_ratio(info.get('returnOnEquity'))
+        metrics['ROE'] = _pct_from_ratio(roe_info)
 
         # 4. 毛利率
-        metrics['毛利率'] = _pct_from_ratio(info.get('grossMargins'))
+        metrics['毛利率'] = _pct_from_ratio(gm_info)
 
         # 5. 淨利率
-        metrics['淨利率'] = _pct_from_ratio(info.get('profitMargins'))
+        metrics['淨利率'] = _pct_from_ratio(pm_info)
 
         # 6. P/B
-        pb = info.get('priceToBook')
-        if not pb and metrics['每股淨值']:
-            px = info.get('currentPrice') or info.get('regularMarketPrice')
-            if px:
-                pb = px / metrics['每股淨值']
         metrics['股價淨值比'] = pb or 0
 
-        # 7. 股息殖利率
-        metrics['股息殖利率'] = _pct_from_ratio(info.get('dividendYield'))
+        # 7. 股息殖利率 (dy 來源: info 為 0-1 比例,TWSE 為 %)
+        if dy is None or dy == 0:
+            metrics['股息殖利率'] = 0
+        elif dy < 1:  # info 格式
+            metrics['股息殖利率'] = dy * 100
+        else:  # TWSE 已是 %
+            metrics['股息殖利率'] = dy
 
         # 8. 營收年增率
-        metrics['營收年增率'] = _pct_from_ratio(info.get('revenueGrowth'))
+        metrics['營收年增率'] = _pct_from_ratio(rg_info)
 
-        # 9-10. 總資產週轉率 & 權益乘數 — 需要 total_assets/equity
+        # 9-10. 總資產週轉率 & 權益乘數 (選配,抓不到就 0)
         total_rev = info.get('totalRevenue')
         total_assets = None
         total_equity = None
-
-        # 先從 balance sheet 試著取 (年報/季報都試)
         for attr in ('balance_sheet', 'quarterly_balance_sheet'):
             try:
                 bs = getattr(ticker, attr, None)
@@ -582,20 +696,11 @@ def get_fundamental_data(ticker_symbol):
                         break
             except Exception:
                 continue
-
-        # 備援: info 自己的總資產
         if not total_equity:
             total_equity = info.get('totalStockholderEquity')
 
-        if total_rev and total_assets:
-            metrics['總資產週轉率'] = total_rev / total_assets
-        else:
-            metrics['總資產週轉率'] = 0
-
-        if total_assets and total_equity:
-            metrics['權益乘數'] = total_assets / total_equity
-        else:
-            metrics['權益乘數'] = 0
+        metrics['總資產週轉率'] = (total_rev / total_assets) if (total_rev and total_assets) else 0
+        metrics['權益乘數'] = (total_assets / total_equity) if (total_assets and total_equity) else 0
 
         # 11. 報表期別
         period_ts = info.get('mostRecentQuarter') or info.get('lastFiscalYearEnd')
@@ -604,8 +709,13 @@ def get_fundamental_data(ticker_symbol):
                 metrics['報表期別'] = datetime.fromtimestamp(period_ts).strftime('%Y-%m-%d')
             except Exception:
                 metrics['報表期別'] = 'TTM'
+        elif twse_val:
+            metrics['報表期別'] = f"TWSE 日報 ({twse_val['日期'].strftime('%Y-%m-%d')})"
         else:
             metrics['報表期別'] = 'TTM (最近四季)'
+
+        # 12. 資料來源標記 (給 UI 區分)
+        metrics['_source'] = 'yfinance+TWSE' if twse_val else 'yfinance'
 
         return metrics
 
@@ -1135,9 +1245,14 @@ with tab1:
                 with st.spinner("載入財報資料..."):
                     fundamental_data = get_fundamental_data(ticker_symbol)
 
-                if fundamental_data and fundamental_data['每股盈餘'] != 0:
+                if fundamental_data and (
+                    fundamental_data.get('每股盈餘', 0) != 0
+                    or fundamental_data.get('每股淨值', 0) != 0
+                    or fundamental_data.get('股價淨值比', 0) != 0
+                ):
                     report_period = fundamental_data.get('報表期別', 'N/A')
-                    st.caption(f"📅 財報期別: {report_period} | 代號: {ticker_symbol}")
+                    source = fundamental_data.get('_source', 'yfinance')
+                    st.caption(f"📅 財報期別: {report_period} | 代號: {ticker_symbol} | 來源: {source}")
 
                     # 財務指標
                     st.markdown("##### 💼 財務指標 (最新年度)")
