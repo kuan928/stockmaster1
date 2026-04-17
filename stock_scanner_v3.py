@@ -53,26 +53,205 @@ def get_stock_data(code, period="6mo"):
     except:
         return None, None, None
 
-def get_institutional_data(stock_code):
-    """取得法人買賣資料 (模擬數據)"""
-    # 註: 實際應用需要連接真實的台股資料源
-    # 這裡提供模擬數據結構
+def _parse_int(v):
+    """字串轉整數 (處理 '1,234,567'、'-'、空白)。"""
+    if v is None:
+        return 0
     try:
-        # 模擬最近5天的法人買賣
-        dates = pd.date_range(end=datetime.now(), periods=5, freq='D')
-        
-        data = {
-            '日期': dates,
-            '外資買賣': np.random.randint(-5000, 8000, 5),  # 張數
-            '投信買賣': np.random.randint(-2000, 3000, 5),
-            '自營商買賣': np.random.randint(-1000, 2000, 5),
-            '融資增減': np.random.randint(-500, 1000, 5),
-            '融券增減': np.random.randint(-200, 300, 5),
-        }
-        
-        return pd.DataFrame(data)
-    except:
+        s = str(v).replace(',', '').replace(' ', '').strip()
+        if s in ('', '-', '--'):
+            return 0
+        return int(float(s))
+    except Exception:
+        return 0
+
+
+def _roc_date(dt):
+    """datetime → ROC 年/月/日 (例: 2026-04-17 → 115/04/17)"""
+    return f"{dt.year - 1911}/{dt.month:02d}/{dt.day:02d}"
+
+
+def _recent_trading_dates(n=5):
+    """回傳最近 n 個交易日 (跳過週末;若為當天且收盤前,跳過當天)"""
+    dates = []
+    now = datetime.now()
+    d = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    # TWSE/TPEX 資料約 15:00 後才公布,16:00 前保守跳過當日
+    if now.hour < 16:
+        d = d - timedelta(days=1)
+    while len(dates) < n:
+        if d.weekday() < 5:
+            dates.append(d)
+        d = d - timedelta(days=1)
+    return dates
+
+
+@st.cache_data(ttl=14400, show_spinner=False)
+def _fetch_twse_insti_day(date_ymd):
+    """抓 TWSE 某日三大法人 (YYYYMMDD)。回傳 DataFrame 或 None。"""
+    try:
+        url = "https://www.twse.com.tw/rwd/zh/fund/T86"
+        params = {"date": date_ymd, "selectType": "ALL", "response": "json"}
+        r = requests.get(url, params=params, timeout=15,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        if j.get('stat') != 'OK' or not j.get('data'):
+            return None
+        df = pd.DataFrame(j['data'], columns=j['fields'])
+        df.columns = [str(c).strip() for c in df.columns]
+        return df
+    except Exception:
         return None
+
+
+@st.cache_data(ttl=14400, show_spinner=False)
+def _fetch_tpex_insti_day(date_roc):
+    """抓 TPEX 某日三大法人 (ROC: YYY/MM/DD)。回傳 DataFrame 或 None。"""
+    try:
+        url = "https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade"
+        params = {"type": "Daily", "sect": "AL", "date": date_roc,
+                  "id": "", "response": "json"}
+        r = requests.get(url, params=params, timeout=15,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        tables = j.get('tables') or []
+        for t in tables:
+            fields = t.get('fields') or []
+            data = t.get('data') or []
+            if fields and data:
+                df = pd.DataFrame(data, columns=[str(c).strip() for c in fields])
+                return df
+        if j.get('aaData'):
+            return pd.DataFrame(j['aaData'])
+        return None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=14400, show_spinner=False)
+def _fetch_twse_margin_day(date_ymd):
+    """抓 TWSE 某日融資融券 (YYYYMMDD)。回傳 DataFrame 或 None。"""
+    try:
+        url = "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN"
+        params = {"date": date_ymd, "selectType": "ALL", "response": "json"}
+        r = requests.get(url, params=params, timeout=15,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        # 新版回傳 tables[*]; 舊版 creditList
+        tables = j.get('tables') or []
+        for t in tables:
+            fields = t.get('fields') or []
+            data = t.get('data') or []
+            if fields and data and any('股票代號' in str(c) or '證券代號' in str(c) for c in fields):
+                df = pd.DataFrame(data, columns=[str(c).strip() for c in fields])
+                return df
+        cl = j.get('creditList') or {}
+        if cl.get('fields') and cl.get('data'):
+            return pd.DataFrame(cl['data'], columns=[str(c).strip() for c in cl['fields']])
+        return None
+    except Exception:
+        return None
+
+
+def _match_stock_row(df, stock_code):
+    """從 DataFrame 找出代號對應列 (支援多種欄位名)。"""
+    if df is None or df.empty:
+        return None
+    code_col = None
+    for c in df.columns:
+        cs = str(c)
+        if '證券代號' in cs or '股票代號' in cs or '代號' in cs:
+            code_col = c
+            break
+    if code_col is None:
+        return None
+    mask = df[code_col].astype(str).str.strip() == str(stock_code).strip()
+    match = df[mask]
+    return match.iloc[0] if not match.empty else None
+
+
+def _find_col(row, keywords):
+    """找第一個欄位名包含任一 keyword 的值 (int)。"""
+    for col in row.index:
+        cs = str(col)
+        for kw in keywords:
+            if kw in cs:
+                return _parse_int(row[col])
+    return 0
+
+
+def get_institutional_data(stock_code, is_otc=False, days=5):
+    """取得真實三大法人 + 融資融券資料 (TWSE / TPEX)。
+    回傳: DataFrame 含 [日期, 外資買賣, 投信買賣, 自營商買賣, 融資增減, 融券增減] (單位: 張)
+          取不到則回傳 None。
+    """
+    # 美股/純英文代號不支援
+    if not str(stock_code).strip().isdigit():
+        return None
+
+    rows = []
+    for dt in _recent_trading_dates(days):
+        foreign = trust = dealer = 0
+        margin = short = 0
+        found = False
+
+        if is_otc:
+            df_i = _fetch_tpex_insti_day(_roc_date(dt))
+            row = _match_stock_row(df_i, stock_code) if df_i is not None else None
+            if row is not None:
+                # TPEX 通常以「張」為單位;若是「股數」則以名稱判斷
+                use_shares = any('股數' in str(c) for c in row.index)
+                foreign = _find_col(row, ['外資及陸資', '外陸資', '外資'])
+                trust = _find_col(row, ['投信'])
+                dealer = _find_col(row, ['自營商'])
+                if use_shares:
+                    foreign //= 1000
+                    trust //= 1000
+                    dealer //= 1000
+                found = True
+        else:
+            df_i = _fetch_twse_insti_day(dt.strftime('%Y%m%d'))
+            row = _match_stock_row(df_i, stock_code) if df_i is not None else None
+            if row is not None:
+                f1 = _find_col(row, ['外陸資買賣超股數(不含外資自營商)', '外陸資買賣超'])
+                f2 = _find_col(row, ['外資自營商買賣超股數'])
+                foreign = (f1 + f2) // 1000  # 股 → 張
+                trust = _find_col(row, ['投信買賣超股數', '投信買賣超']) // 1000
+                dealer = _find_col(row, ['自營商買賣超股數', '自營商買賣超']) // 1000
+                found = True
+
+            # 融資融券 (只上市有)
+            df_m = _fetch_twse_margin_day(dt.strftime('%Y%m%d'))
+            mrow = _match_stock_row(df_m, stock_code) if df_m is not None else None
+            if mrow is not None:
+                m_today = _find_col(mrow, ['融資今日餘額', '今日餘額'])
+                m_prev = _find_col(mrow, ['融資前日餘額', '前日餘額'])
+                margin = m_today - m_prev if (m_today or m_prev) else 0
+                # 融券:欄位位置通常在融資之後,使用關鍵字差異
+                s_today = _find_col(mrow, ['融券今日餘額'])
+                s_prev = _find_col(mrow, ['融券前日餘額'])
+                short = s_today - s_prev if (s_today or s_prev) else 0
+
+        if found:
+            rows.append({
+                '日期': dt,
+                '外資買賣': foreign,
+                '投信買賣': trust,
+                '自營商買賣': dealer,
+                '融資增減': margin,
+                '融券增減': short,
+            })
+
+    if not rows:
+        return None
+    out = pd.DataFrame(rows).sort_values('日期').reset_index(drop=True)
+    return out
 
 # ==================== 財報分析函數 ====================
 
@@ -502,8 +681,10 @@ with tab1:
 
             if df is not None and not df.empty:
                 df = calc_indicators(df)
-                inst_df = get_institutional_data(stock_code)
-                
+                is_otc = bool(ticker_symbol and ticker_symbol.endswith('.TWO'))
+                with st.spinner("載入法人買賣資料 (TWSE/TPEX)..."):
+                    inst_df = get_institutional_data(stock_code, is_otc=is_otc)
+
                 try:
                     company_name = stock.info.get('longName', stock_code)
                 except:
@@ -589,23 +770,32 @@ with tab1:
                 
                 with col2:
                     st.subheader(f"💼 籌碼面分析 ({inst_score:+d}分)")
-                    
-                    if inst_signals:
-                        for key, (desc, signal_type, score) in inst_signals.items():
-                            if signal_type == 'BUY':
-                                st.success(f"**{key}:** {desc} (+{score}分)")
-                            elif signal_type == 'SELL':
-                                st.error(f"**{key}:** {desc} ({score}分)")
-                            else:
-                                st.info(f"**{key}:** {desc}")
-                    
-                    if inst_df is not None:
-                        st.markdown("##### 近5日法人買賣")
+
+                    if inst_df is not None and not inst_df.empty:
+                        st.caption(f"資料來源: {'TPEX 櫃買中心' if is_otc else 'TWSE 證交所'} (真實)")
+
+                        if inst_signals:
+                            for key, (desc, signal_type, score) in inst_signals.items():
+                                if signal_type == 'BUY':
+                                    st.success(f"**{key}:** {desc} (+{score}分)")
+                                elif signal_type == 'SELL':
+                                    st.error(f"**{key}:** {desc} ({score}分)")
+                                else:
+                                    st.info(f"**{key}:** {desc}")
+
+                        st.markdown("##### 近日法人買賣 (單位: 張)")
+                        display_df = inst_df.copy()
+                        display_df['日期'] = pd.to_datetime(display_df['日期']).dt.strftime('%Y-%m-%d')
                         st.dataframe(
-                            inst_df[['日期', '外資買賣', '投信買賣', '自營商買賣']].tail(5),
+                            display_df[['日期', '外資買賣', '投信買賣', '自營商買賣']].tail(5),
                             use_container_width=True,
                             hide_index=True
                         )
+                    else:
+                        if str(stock_code).strip().isdigit():
+                            st.warning("⚠️ 無法取得真實籌碼資料 (TWSE/TPEX 可能暫時無回應或假日)")
+                        else:
+                            st.info("ℹ️ 美股/非台股不提供籌碼面分析")
                 
                 st.markdown("---")
                 
@@ -801,7 +991,7 @@ with tab2:
 
     with col3:
         st.markdown("#### 💼 籌碼面條件")
-        st.warning("⚠️ 籌碼數據為模擬,僅供 UI 展示", icon="⚠️")
+        st.caption("資料來源: TWSE (上市) / TPEX (上櫃) 真實法人資料")
 
         inst_conditions = []
 
@@ -902,7 +1092,8 @@ with tab2:
                     continue
 
                 df = calc_indicators(df)
-                inst_df = get_institutional_data(code)
+                is_otc_code = bool(ticker_used and ticker_used.endswith('.TWO'))
+                inst_df = get_institutional_data(code, is_otc=is_otc_code) if len(inst_conditions) > 0 else None
 
                 tech_signals, tech_score = analyze_technical(df)
                 inst_signals, inst_score = analyze_institutional(inst_df)
@@ -934,24 +1125,24 @@ with tab2:
                 if "站上MA20" in tech_conditions:
                     condition_results.append(("站上MA20", latest['Close'] > latest['MA20']))
 
-                # --- 籌碼面條件 (模擬數據,僅示意) ---
+                # --- 籌碼面條件 (TWSE/TPEX 真實資料) ---
                 if "外資買超" in inst_conditions:
                     passed = '外資' in inst_signals and inst_signals['外資'][1] == 'BUY'
-                    condition_results.append(("外資買超*", passed))
+                    condition_results.append(("外資買超", passed))
                 if "投信買超" in inst_conditions:
                     passed = '投信' in inst_signals and inst_signals['投信'][1] == 'BUY'
-                    condition_results.append(("投信買超*", passed))
+                    condition_results.append(("投信買超", passed))
                 if "自營商買超" in inst_conditions:
                     passed = '自營商' in inst_signals and inst_signals['自營商'][1] == 'BUY'
-                    condition_results.append(("自營商買超*", passed))
+                    condition_results.append(("自營商買超", passed))
                 if "三法人買超" in inst_conditions:
                     passed = ('外資' in inst_signals and inst_signals['外資'][1] == 'BUY' and
                               '投信' in inst_signals and inst_signals['投信'][1] == 'BUY' and
                               '自營商' in inst_signals and inst_signals['自營商'][1] == 'BUY')
-                    condition_results.append(("三法人買超*", passed))
+                    condition_results.append(("三法人買超", passed))
                 if "融資券雙降" in inst_conditions:
                     passed = '融資券' in inst_signals and '雙降' in inst_signals['融資券'][0]
-                    condition_results.append(("融資券雙降*", passed))
+                    condition_results.append(("融資券雙降", passed))
 
                 # --- 基本面條件 (真實財報資料) ---
                 fund_data = None
@@ -1095,17 +1286,18 @@ with tab3:
             progress.progress((i + 1) / len(stock_list))
             
             try:
-                df, stock, _ = get_stock_data(code, period="3mo")
+                df, stock, ticker_used = get_stock_data(code, period="3mo")
                 if df is None or len(df) < 60:
                     continue
-                
+
                 df = calc_indicators(df)
-                inst_df = get_institutional_data(code)
-                
+                is_otc_code = bool(ticker_used and ticker_used.endswith('.TWO'))
+                inst_df = get_institutional_data(code, is_otc=is_otc_code)
+
                 tech_signals, tech_score = analyze_technical(df)
                 inst_signals, inst_score = analyze_institutional(inst_df)
                 recommendation, action, total_score = get_final_recommendation(tech_score, inst_score)
-                
+
                 # 篩選
                 if filter_option == "建議買進" and action != "BUY":
                     continue
@@ -1163,4 +1355,4 @@ with tab3:
             st.warning("沒有找到符合條件的股票")
 
 st.markdown("---")
-st.caption("⚠️ 本系統僅供參考,投資有風險。籌碼數據為模擬數據,實際使用需連接真實資料源。")
+st.caption("⚠️ 本系統僅供參考,投資有風險。資料來源: yfinance (股價/財報) + TWSE/TPEX (法人籌碼)。")
