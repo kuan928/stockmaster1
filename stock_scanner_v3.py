@@ -487,139 +487,125 @@ def get_insti_last_error():
 
 # ==================== 財報分析函數 ====================
 
+def _safe_get(d, *keys, default=None):
+    """依序嘗試多個 key,回傳第一個 truthy 值。"""
+    for k in keys:
+        v = d.get(k) if d else None
+        if v is not None and v != 0:
+            return v
+    return default
+
+
+def _pct_from_ratio(v):
+    """yfinance 比例值可能為 0-1 (如 0.28) 或 0-100 (如 28);統一換成 %。"""
+    if v is None:
+        return 0
+    try:
+        return v * 100 if abs(v) < 1.5 else v
+    except Exception:
+        return 0
+
+
 def get_fundamental_data(ticker_symbol):
-    """獲取並計算財務指標 (含毛利率/淨利率/ROE/P/B/股息率/營收年增等)"""
+    """獲取並計算財務指標。以 ticker.info (TTM 指標) 為主要來源,
+    financials/balance_sheet 為補強。info 對台股幾乎一定有資料,
+    比 ticker.financials (常為空) 穩定得多。
+    """
     try:
         ticker = yf.Ticker(ticker_symbol)
+        try:
+            info = ticker.info or {}
+        except Exception:
+            info = {}
 
-        # 年報優先,年報無資料時改用季報 (台股常常年報要很久才更新)
-        income_stmt = ticker.financials
-        if income_stmt is None or income_stmt.empty:
-            try:
-                income_stmt = ticker.quarterly_financials
-            except Exception:
-                income_stmt = None
-
-        balance_sheet = ticker.balance_sheet
-        if balance_sheet is None or balance_sheet.empty:
-            try:
-                balance_sheet = ticker.quarterly_balance_sheet
-            except Exception:
-                balance_sheet = None
-
-        info = ticker.info or {}
-
-        if income_stmt is None or income_stmt.empty or balance_sheet is None or balance_sheet.empty:
+        # 只要 info 有任一關鍵財務指標就繼續,不要求 financials
+        has_any = any([
+            info.get('trailingEps'),
+            info.get('forwardEps'),
+            info.get('bookValue'),
+            info.get('returnOnEquity'),
+            info.get('priceToBook'),
+            info.get('trailingPE'),
+            info.get('totalRevenue'),
+        ])
+        if not has_any:
             return None
-
-        latest_income = income_stmt.iloc[:, 0]
-        latest_balance = balance_sheet.iloc[:, 0]
-        prev_income = income_stmt.iloc[:, 1] if income_stmt.shape[1] > 1 else None
 
         metrics = {}
 
-        # 報表日期
-        try:
-            metrics['報表期別'] = str(income_stmt.columns[0])[:10]
-        except:
-            metrics['報表期別'] = 'N/A'
+        # 1. EPS (TTM) — 多層 fallback
+        eps = _safe_get(info, 'trailingEps', 'forwardEps', default=0) or 0
+        metrics['每股盈餘'] = eps
 
-        # 1. 毛利率
-        try:
-            gross_profit = latest_income.get('Gross Profit', 0)
-            total_revenue = latest_income.get('Total Revenue', 1)
-            metrics['毛利率'] = (gross_profit / total_revenue * 100) if total_revenue else 0
-        except:
-            metrics['毛利率'] = 0
+        # 2. 每股淨值 (BVPS)
+        metrics['每股淨值'] = info.get('bookValue') or 0
 
-        # 2. 淨利率
-        try:
-            net_income = latest_income.get('Net Income', 0)
-            total_revenue = latest_income.get('Total Revenue', 1)
-            metrics['淨利率'] = (net_income / total_revenue * 100) if total_revenue else 0
-        except:
-            metrics['淨利率'] = 0
+        # 3. ROE
+        metrics['ROE'] = _pct_from_ratio(info.get('returnOnEquity'))
 
-        # 3. 總資產週轉率
-        try:
-            total_revenue = latest_income.get('Total Revenue', 0)
-            total_assets = latest_balance.get('Total Assets', 1)
-            metrics['總資產週轉率'] = (total_revenue / total_assets) if total_assets else 0
-        except:
+        # 4. 毛利率
+        metrics['毛利率'] = _pct_from_ratio(info.get('grossMargins'))
+
+        # 5. 淨利率
+        metrics['淨利率'] = _pct_from_ratio(info.get('profitMargins'))
+
+        # 6. P/B
+        pb = info.get('priceToBook')
+        if not pb and metrics['每股淨值']:
+            px = info.get('currentPrice') or info.get('regularMarketPrice')
+            if px:
+                pb = px / metrics['每股淨值']
+        metrics['股價淨值比'] = pb or 0
+
+        # 7. 股息殖利率
+        metrics['股息殖利率'] = _pct_from_ratio(info.get('dividendYield'))
+
+        # 8. 營收年增率
+        metrics['營收年增率'] = _pct_from_ratio(info.get('revenueGrowth'))
+
+        # 9-10. 總資產週轉率 & 權益乘數 — 需要 total_assets/equity
+        total_rev = info.get('totalRevenue')
+        total_assets = None
+        total_equity = None
+
+        # 先從 balance sheet 試著取 (年報/季報都試)
+        for attr in ('balance_sheet', 'quarterly_balance_sheet'):
+            try:
+                bs = getattr(ticker, attr, None)
+                if bs is not None and not bs.empty:
+                    col = bs.iloc[:, 0]
+                    if total_assets is None:
+                        total_assets = col.get('Total Assets')
+                    if total_equity is None:
+                        total_equity = col.get('Stockholders Equity') or col.get('Total Stockholder Equity')
+                    if total_assets and total_equity:
+                        break
+            except Exception:
+                continue
+
+        # 備援: info 自己的總資產
+        if not total_equity:
+            total_equity = info.get('totalStockholderEquity')
+
+        if total_rev and total_assets:
+            metrics['總資產週轉率'] = total_rev / total_assets
+        else:
             metrics['總資產週轉率'] = 0
 
-        # 4. 權益乘數
-        try:
-            total_assets = latest_balance.get('Total Assets', 0)
-            total_equity = latest_balance.get('Stockholders Equity', 1)
-            metrics['權益乘數'] = (total_assets / total_equity) if total_equity else 0
-        except:
+        if total_assets and total_equity:
+            metrics['權益乘數'] = total_assets / total_equity
+        else:
             metrics['權益乘數'] = 0
 
-        # 5. 每股淨值 (BVPS)
-        try:
-            total_equity = latest_balance.get('Stockholders Equity', 0)
-            shares_outstanding = info.get('sharesOutstanding') or info.get('impliedSharesOutstanding') or 0
-            metrics['每股淨值'] = (total_equity / shares_outstanding) if shares_outstanding > 0 else 0
-        except:
-            metrics['每股淨值'] = 0
-
-        # 6. 每股盈餘 (EPS) - 多層 fallback
-        try:
-            eps = info.get('trailingEps', None)
-            if eps is None or eps == 0:
-                eps = info.get('forwardEps', None)
-            if eps is None or eps == 0:
-                net_income = latest_income.get('Net Income', 0)
-                shares_outstanding = info.get('sharesOutstanding') or info.get('impliedSharesOutstanding') or 0
-                eps = (net_income / shares_outstanding) if shares_outstanding else 0
-            metrics['每股盈餘'] = eps if eps is not None else 0
-        except:
-            metrics['每股盈餘'] = 0
-
-        # 7. ROE
-        try:
-            net_income = latest_income.get('Net Income', 0)
-            total_equity = latest_balance.get('Stockholders Equity', 1)
-            metrics['ROE'] = (net_income / total_equity * 100) if total_equity else 0
-        except:
-            metrics['ROE'] = 0
-
-        # 8. 股價淨值比 (P/B)
-        try:
-            pb = info.get('priceToBook', None)
-            if pb is None and metrics['每股淨值']:
-                current_price = info.get('currentPrice') or info.get('regularMarketPrice')
-                if current_price:
-                    pb = current_price / metrics['每股淨值']
-            metrics['股價淨值比'] = pb if pb is not None else 0
-        except:
-            metrics['股價淨值比'] = 0
-
-        # 9. 股息殖利率
-        try:
-            dy = info.get('dividendYield', None)
-            # yfinance 有時回傳 0.03 (3%)，有時回傳 3.0；統一處理為 %
-            if dy is not None:
-                metrics['股息殖利率'] = dy * 100 if dy < 1 else dy
-            else:
-                metrics['股息殖利率'] = 0
-        except:
-            metrics['股息殖利率'] = 0
-
-        # 10. 營收年增率 (YoY)
-        try:
-            if prev_income is not None:
-                curr_rev = latest_income.get('Total Revenue', 0)
-                prev_rev = prev_income.get('Total Revenue', 0)
-                if prev_rev:
-                    metrics['營收年增率'] = (curr_rev - prev_rev) / abs(prev_rev) * 100
-                else:
-                    metrics['營收年增率'] = 0
-            else:
-                metrics['營收年增率'] = 0
-        except:
-            metrics['營收年增率'] = 0
+        # 11. 報表期別
+        period_ts = info.get('mostRecentQuarter') or info.get('lastFiscalYearEnd')
+        if isinstance(period_ts, (int, float)) and period_ts > 0:
+            try:
+                metrics['報表期別'] = datetime.fromtimestamp(period_ts).strftime('%Y-%m-%d')
+            except Exception:
+                metrics['報表期別'] = 'TTM'
+        else:
+            metrics['報表期別'] = 'TTM (最近四季)'
 
         return metrics
 
