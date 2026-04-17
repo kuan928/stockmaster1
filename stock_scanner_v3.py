@@ -29,6 +29,14 @@ st.markdown("""
 
 # ==================== 資料取得 ====================
 
+def _clean_history(df):
+    """丟掉今天尚未收盤的 NaN Close 列,保留完整交易日。"""
+    if df is None or df.empty:
+        return df
+    df = df.dropna(subset=['Close'])
+    return df
+
+
 def get_stock_data(code, period="6mo"):
     """取得股價資料，並回傳實際使用的 ticker 代號 (.TW 或 .TWO)。"""
     try:
@@ -39,20 +47,20 @@ def get_stock_data(code, period="6mo"):
         # 已含副檔名 (例: 2330.TW, AAPL.US) 或純英文 (美股)
         if '.' in code or not code.replace('-', '').isdigit():
             stock = yf.Ticker(code)
-            df = stock.history(period=period)
-            if not df.empty:
+            df = _clean_history(stock.history(period=period))
+            if df is not None and not df.empty:
                 return df, stock, code
             return None, None, None
 
         # 台股: 先試 .TW 再試 .TWO
         ticker = f"{code}.TW"
         stock = yf.Ticker(ticker)
-        df = stock.history(period=period)
-        if df.empty:
+        df = _clean_history(stock.history(period=period))
+        if df is None or df.empty:
             ticker = f"{code}.TWO"
             stock = yf.Ticker(ticker)
-            df = stock.history(period=period)
-        if not df.empty:
+            df = _clean_history(stock.history(period=period))
+        if df is not None and not df.empty:
             return df, stock, ticker
         return None, None, None
     except Exception:
@@ -284,8 +292,21 @@ def get_fundamental_data(ticker_symbol):
     try:
         ticker = yf.Ticker(ticker_symbol)
 
+        # 年報優先,年報無資料時改用季報 (台股常常年報要很久才更新)
         income_stmt = ticker.financials
+        if income_stmt is None or income_stmt.empty:
+            try:
+                income_stmt = ticker.quarterly_financials
+            except Exception:
+                income_stmt = None
+
         balance_sheet = ticker.balance_sheet
+        if balance_sheet is None or balance_sheet.empty:
+            try:
+                balance_sheet = ticker.quarterly_balance_sheet
+            except Exception:
+                balance_sheet = None
+
         info = ticker.info or {}
 
         if income_stmt is None or income_stmt.empty or balance_sheet is None or balance_sheet.empty:
