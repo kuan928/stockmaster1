@@ -102,6 +102,33 @@ _HTTP_HEADERS = {
 }
 
 
+def _df_from_any(j):
+    """TWSE/TPEX 新舊版回傳格式統一解析。"""
+    # 新版: 頂層 tables: [{title, fields, data}, ...]
+    tables = j.get('tables') or []
+    candidates = []
+    for t in tables:
+        fields = t.get('fields') or []
+        data = t.get('data') or []
+        if fields and data and len(data[0]) == len(fields):
+            candidates.append((t.get('title', ''), fields, data))
+    # 有多個 table 時,挑欄位數最多者 (通常是主表)
+    if candidates:
+        _, fields, data = max(candidates, key=lambda c: len(c[1]))
+        df = pd.DataFrame(data, columns=[str(c).strip() for c in fields])
+        return df
+    # 舊版: 頂層 fields + data
+    if j.get('fields') and j.get('data'):
+        fields = j['fields']
+        data = j['data']
+        if data and len(data[0]) == len(fields):
+            return pd.DataFrame(data, columns=[str(c).strip() for c in fields])
+    # 更舊版: aaData
+    if j.get('aaData'):
+        return pd.DataFrame(j['aaData'])
+    return None
+
+
 @st.cache_data(ttl=14400, show_spinner=False)
 def _fetch_twse_insti_day(date_ymd):
     """抓 TWSE 某日三大法人 (YYYYMMDD)。回傳 DataFrame 或 None。"""
@@ -115,17 +142,20 @@ def _fetch_twse_insti_day(date_ymd):
             _INSTI_LAST_ERROR["value"] = f"TWSE HTTP {r.status_code}"
             return None
         j = r.json()
-        if j.get('stat') != 'OK' or not j.get('data'):
-            _INSTI_LAST_ERROR["value"] = f"TWSE stat={j.get('stat','?')} (date={date_ymd}) — 可能為假日"
+        # stat 可能不存在於新版回傳;優先以 tables/fields 判斷是否有資料
+        df = _df_from_any(j)
+        if df is None or df.empty:
+            _INSTI_LAST_ERROR["value"] = (
+                f"TWSE 無資料 stat={j.get('stat','?')} date={date_ymd} "
+                f"keys={list(j.keys())[:5]}"
+            )
             return None
-        df = pd.DataFrame(j['data'], columns=j['fields'])
-        df.columns = [str(c).strip() for c in df.columns]
         return df
     except requests.exceptions.Timeout:
         _INSTI_LAST_ERROR["value"] = "TWSE 連線逾時 (8秒)"
         return None
     except Exception as e:
-        _INSTI_LAST_ERROR["value"] = f"TWSE 錯誤: {type(e).__name__}"
+        _INSTI_LAST_ERROR["value"] = f"TWSE 錯誤: {type(e).__name__}: {e}"
         return None
 
 
@@ -143,22 +173,18 @@ def _fetch_tpex_insti_day(date_roc):
             _INSTI_LAST_ERROR["value"] = f"TPEX HTTP {r.status_code}"
             return None
         j = r.json()
-        tables = j.get('tables') or []
-        for t in tables:
-            fields = t.get('fields') or []
-            data = t.get('data') or []
-            if fields and data:
-                df = pd.DataFrame(data, columns=[str(c).strip() for c in fields])
-                return df
-        if j.get('aaData'):
-            return pd.DataFrame(j['aaData'])
-        _INSTI_LAST_ERROR["value"] = f"TPEX 回傳無資料 (date={date_roc}) — 可能為假日"
-        return None
+        df = _df_from_any(j)
+        if df is None or df.empty:
+            _INSTI_LAST_ERROR["value"] = (
+                f"TPEX 無資料 date={date_roc} keys={list(j.keys())[:5]}"
+            )
+            return None
+        return df
     except requests.exceptions.Timeout:
         _INSTI_LAST_ERROR["value"] = "TPEX 連線逾時 (8秒)"
         return None
     except Exception as e:
-        _INSTI_LAST_ERROR["value"] = f"TPEX 錯誤: {type(e).__name__}"
+        _INSTI_LAST_ERROR["value"] = f"TPEX 錯誤: {type(e).__name__}: {e}"
         return None
 
 
@@ -695,6 +721,45 @@ with st.sidebar:
                 st.success(f"✅ {name}: {detail}")
             else:
                 st.error(f"❌ {name}: {detail}")
+
+    st.markdown("---")
+    st.caption("下方按鈕會抓最近 3 個交易日的 2330 法人資料,並顯示原始欄位供除錯。")
+    if st.button("🔍 實測抓 2330 法人資料"):
+        # 直接呼叫 production 函式,看是否成功
+        _INSTI_LAST_ERROR["value"] = None
+        test_df = get_institutional_data("2330", is_otc=False, days=3)
+        if test_df is not None and not test_df.empty:
+            st.success("✅ 法人資料抓取成功")
+            st.dataframe(test_df, use_container_width=True, hide_index=True)
+        else:
+            st.error(f"❌ 抓取失敗: {get_insti_last_error() or '未知'}")
+
+        # 額外顯示 TWSE 原始 JSON 的 top-level keys + 第一個 table 的 fields
+        st.markdown("##### 🔬 TWSE 原始回傳結構 (供除錯)")
+        try:
+            probe_dates = _recent_trading_dates(1)
+            if probe_dates:
+                ymd = probe_dates[0].strftime('%Y%m%d')
+                r = requests.get(
+                    "https://www.twse.com.tw/rwd/zh/fund/T86",
+                    params={"date": ymd, "selectType": "ALL", "response": "json"},
+                    headers={**_HTTP_HEADERS, "Referer": "https://www.twse.com.tw/"},
+                    timeout=8,
+                )
+                if r.status_code == 200:
+                    j = r.json()
+                    st.code(f"date tried: {ymd}\ntop-level keys: {list(j.keys())}\n"
+                            f"stat: {j.get('stat')}\n"
+                            f"top fields count: {len(j.get('fields') or [])}\n"
+                            f"top data rows: {len(j.get('data') or [])}\n"
+                            f"tables count: {len(j.get('tables') or [])}\n"
+                            + (f"tables[0] fields (前6): {[str(x)[:30] for x in (j.get('tables')[0].get('fields') or [])[:6]]}\n"
+                               f"tables[0] data rows: {len(j.get('tables')[0].get('data') or [])}"
+                               if j.get('tables') else ""))
+                else:
+                    st.code(f"HTTP {r.status_code}")
+        except Exception as e:
+            st.code(f"錯誤: {type(e).__name__}: {e}")
 
 tab1, tab2, tab3 = st.tabs(["🔍 單股分析", "🎯 智能選股", "📊 批次掃描"])
 
