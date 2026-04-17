@@ -656,31 +656,59 @@ def get_fundamental_data(ticker_symbol):
         # 2. 每股淨值 (BVPS) (已 fallback: info → PB*price 反推)
         metrics['每股淨值'] = bvps or 0
 
-        # 3. ROE
-        metrics['ROE'] = _pct_from_ratio(roe_info)
-
-        # 4. 毛利率
-        metrics['毛利率'] = _pct_from_ratio(gm_info)
-
-        # 5. 淨利率
-        metrics['淨利率'] = _pct_from_ratio(pm_info)
-
-        # 6. P/B
+        # 3. P/B (先算,後面 ROE 可能用到)
         metrics['股價淨值比'] = pb or 0
 
-        # 7. 股息殖利率 (dy 來源: info 為 0-1 比例,TWSE 為 %)
+        # 4. 股息殖利率 (dy 來源: info 為 0-1 比例,TWSE 為 %)
         if dy is None or dy == 0:
             metrics['股息殖利率'] = 0
-        elif dy < 1:  # info 格式
+        elif dy < 1:
             metrics['股息殖利率'] = dy * 100
-        else:  # TWSE 已是 %
+        else:
             metrics['股息殖利率'] = dy
 
-        # 8. 營收年增率
-        metrics['營收年增率'] = _pct_from_ratio(rg_info)
-
-        # 9-10. 總資產週轉率 & 權益乘數 (選配,抓不到就 0)
+        # 5-7. 毛利率 / 淨利率 / 營收 — 試從 info,失敗試 financials
+        gm = _pct_from_ratio(gm_info)
+        pm = _pct_from_ratio(pm_info)
+        rg = _pct_from_ratio(rg_info)
         total_rev = info.get('totalRevenue')
+
+        # financials 補援 (對較小台股有時會有資料)
+        try:
+            fin = None
+            for attr in ('financials', 'quarterly_financials', 'income_stmt', 'quarterly_income_stmt'):
+                try:
+                    cand = getattr(ticker, attr, None)
+                    if cand is not None and not cand.empty:
+                        fin = cand
+                        break
+                except Exception:
+                    continue
+            if fin is not None:
+                latest = fin.iloc[:, 0]
+                prev = fin.iloc[:, 1] if fin.shape[1] > 1 else None
+                rev = latest.get('Total Revenue') or latest.get('Operating Revenue')
+                gp = latest.get('Gross Profit')
+                ni = latest.get('Net Income') or latest.get('Net Income Common Stockholders')
+                if rev:
+                    if not total_rev:
+                        total_rev = rev
+                    if gm == 0 and gp:
+                        gm = gp / rev * 100
+                    if pm == 0 and ni:
+                        pm = ni / rev * 100
+                if rg == 0 and prev is not None:
+                    prev_rev = prev.get('Total Revenue') or prev.get('Operating Revenue')
+                    if rev and prev_rev:
+                        rg = (rev - prev_rev) / abs(prev_rev) * 100
+        except Exception:
+            pass
+
+        metrics['毛利率'] = gm
+        metrics['淨利率'] = pm
+        metrics['營收年增率'] = rg
+
+        # 8-9. 總資產週轉率 & 權益乘數
         total_assets = None
         total_equity = None
         for attr in ('balance_sheet', 'quarterly_balance_sheet'):
@@ -701,6 +729,15 @@ def get_fundamental_data(ticker_symbol):
 
         metrics['總資產週轉率'] = (total_rev / total_assets) if (total_rev and total_assets) else 0
         metrics['權益乘數'] = (total_assets / total_equity) if (total_assets and total_equity) else 0
+
+        # 10. ROE — 優先 info,否則用杜邦恆等式:ROE = EPS / 每股淨值 × 100
+        roe = _pct_from_ratio(roe_info)
+        if roe == 0 and metrics['每股盈餘'] and metrics['每股淨值']:
+            try:
+                roe = metrics['每股盈餘'] / metrics['每股淨值'] * 100
+            except Exception:
+                roe = 0
+        metrics['ROE'] = roe
 
         # 11. 報表期別
         period_ts = info.get('mostRecentQuarter') or info.get('lastFiscalYearEnd')
@@ -1257,19 +1294,26 @@ with tab1:
                     # 財務指標
                     st.markdown("##### 💼 財務指標 (最新年度)")
 
+                    def _fmt_pct(v):
+                        return f"{v:.2f}%" if v else "N/A"
+                    def _fmt_num(v):
+                        return f"{v:.2f}" if v else "N/A"
+
                     col1, col2, col3 = st.columns(3)
 
                     with col1:
-                        st.metric("毛利率", f"{fundamental_data['毛利率']:.2f}%")
-                        st.metric("淨利率", f"{fundamental_data['淨利率']:.2f}%")
+                        st.metric("毛利率", _fmt_pct(fundamental_data['毛利率']))
+                        st.metric("淨利率", _fmt_pct(fundamental_data['淨利率']))
 
                     with col2:
-                        st.metric("總資產週轉率", f"{fundamental_data['總資產週轉率']:.2f}")
-                        st.metric("權益乘數", f"{fundamental_data['權益乘數']:.2f}")
+                        st.metric("總資產週轉率", _fmt_num(fundamental_data['總資產週轉率']))
+                        st.metric("權益乘數", _fmt_num(fundamental_data['權益乘數']))
 
                     with col3:
-                        st.metric("每股淨值", f"${fundamental_data['每股淨值']:.2f}")
-                        st.metric("EPS", f"${fundamental_data['每股盈餘']:.2f}")
+                        bvps_v = fundamental_data.get('每股淨值', 0)
+                        eps_v = fundamental_data.get('每股盈餘', 0)
+                        st.metric("每股淨值", f"${bvps_v:.2f}" if bvps_v else "N/A")
+                        st.metric("EPS", f"${eps_v:.2f}" if eps_v else "N/A")
 
                     # 延伸指標
                     col1, col2, col3 = st.columns(3)
@@ -1283,7 +1327,11 @@ with tab1:
                         yoy = fundamental_data.get('營收年增率', 0)
                         st.metric("營收年增率", f"{yoy:+.2f}%" if yoy else "N/A")
 
-                    st.info(f"📈 **ROE:** {fundamental_data['ROE']:.2f}%")
+                    roe_v = fundamental_data.get('ROE', 0)
+                    if roe_v:
+                        st.info(f"📈 **ROE:** {roe_v:.2f}% (若 yfinance 無提供,由 EPS ÷ 每股淨值 推算)")
+                    else:
+                        st.info("📈 **ROE:** N/A (無足夠資料推算)")
                     
                     st.markdown("---")
                     
