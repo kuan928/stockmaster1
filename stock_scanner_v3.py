@@ -481,14 +481,20 @@ tab1, tab2, tab3 = st.tabs(["🔍 單股分析", "🎯 智能選股", "📊 批�
 # ==================== Tab 1: 單股完整分析 ====================
 with tab1:
     col1, col2 = st.columns([3, 1])
-    
+
     with col1:
-        stock_code = st.text_input("🔢 輸入股票代號", value="2330")
-    
+        stock_code = st.text_input(
+            "🔢 輸入股票代號",
+            value="2330",
+            help="台股上市:2330 | 上櫃/興櫃:6488 (自動加 .TWO) | 美股:AAPL, TSLA, NVDA",
+        )
+
     with col2:
         st.write("")
         st.write("")
         analyze_btn = st.button("🚀 完整分析", type="primary", use_container_width=True)
+
+    st.caption("💡 支援市場: 台股上市(.TW)、上櫃/興櫃(.TWO)、美股 (直接輸入英文代號如 AAPL)")
     
     if analyze_btn:
         with st.spinner("分析中..."):
@@ -728,80 +734,119 @@ with tab1:
 # ==================== Tab 2: 智能選股 ====================
 with tab2:
     st.subheader("🎯 自訂條件選股")
-    st.markdown("選擇你要的條件,系統自動幫你從台股找出符合的股票")
-    
-    col1, col2 = st.columns(2)
-    
+    st.markdown("勾選技術面 + 基本面 + 籌碼面條件,系統自動找出符合的股票 (支援台股、上櫃/興櫃、美股)")
+
+    col1, col2, col3 = st.columns(3)
+
     with col1:
         st.markdown("#### 📈 技術面條件")
-        
+
         tech_conditions = []
-        
+
         if st.checkbox("✅ 多頭排列 (價 > MA5 > MA10 > MA20)"):
             tech_conditions.append("多頭排列")
-        
-        if st.checkbox("✅ MA黃金交叉 (MA5交叉MA10或MA10交叉MA20)"):
+
+        if st.checkbox("✅ MA黃金交叉"):
             tech_conditions.append("MA黃金交叉")
-        
+
         if st.checkbox("✅ MACD紅柱或剛轉紅"):
             tech_conditions.append("MACD紅柱")
-        
+
         if st.checkbox("✅ RSI超賣 (< 30)"):
             tech_conditions.append("RSI超賣")
-        
+
         if st.checkbox("✅ KD低檔 (< 20)"):
             tech_conditions.append("KD低檔")
-        
+
         if st.checkbox("✅ 放量上漲 (量 > 5日均量 1.5倍)"):
             tech_conditions.append("放量")
-        
+
         if st.checkbox("✅ 站上MA20"):
             tech_conditions.append("站上MA20")
-    
+
     with col2:
+        st.markdown("#### 📊 基本面條件")
+        st.caption("資料來源: yfinance 財報 (真實數據)")
+
+        fund_conditions = []
+
+        if st.checkbox("✅ EPS > 0 (有獲利)"):
+            fund_conditions.append(("EPS_positive", 0))
+
+        roe_thresh = st.number_input("ROE ≥ (%)", min_value=0.0, max_value=100.0, value=15.0, step=1.0, key="roe_t")
+        if st.checkbox(f"✅ ROE ≥ {roe_thresh:.0f}%"):
+            fund_conditions.append(("ROE", roe_thresh))
+
+        gm_thresh = st.number_input("毛利率 ≥ (%)", min_value=0.0, max_value=100.0, value=30.0, step=5.0, key="gm_t")
+        if st.checkbox(f"✅ 毛利率 ≥ {gm_thresh:.0f}%"):
+            fund_conditions.append(("毛利率", gm_thresh))
+
+        nm_thresh = st.number_input("淨利率 ≥ (%)", min_value=0.0, max_value=100.0, value=10.0, step=1.0, key="nm_t")
+        if st.checkbox(f"✅ 淨利率 ≥ {nm_thresh:.0f}%"):
+            fund_conditions.append(("淨利率", nm_thresh))
+
+        pb_thresh = st.number_input("P/B ≤", min_value=0.1, max_value=50.0, value=3.0, step=0.5, key="pb_t")
+        if st.checkbox(f"✅ 股價淨值比 ≤ {pb_thresh:.1f}"):
+            fund_conditions.append(("股價淨值比_max", pb_thresh))
+
+        dy_thresh = st.number_input("股息殖利率 ≥ (%)", min_value=0.0, max_value=30.0, value=3.0, step=0.5, key="dy_t")
+        if st.checkbox(f"✅ 股息殖利率 ≥ {dy_thresh:.1f}%"):
+            fund_conditions.append(("股息殖利率", dy_thresh))
+
+        if st.checkbox("✅ 營收年增率 > 0"):
+            fund_conditions.append(("營收年增率", 0))
+
+        if st.checkbox("✅ 估值判斷: 便宜 或 合理"):
+            fund_conditions.append(("估值", "cheap_fair"))
+
+    with col3:
         st.markdown("#### 💼 籌碼面條件")
-        
+        st.warning("⚠️ 籌碼數據為模擬,僅供 UI 展示", icon="⚠️")
+
         inst_conditions = []
-        
+
         if st.checkbox("✅ 外資近3日買超"):
             inst_conditions.append("外資買超")
-        
+
         if st.checkbox("✅ 投信近3日買超"):
             inst_conditions.append("投信買超")
-        
+
         if st.checkbox("✅ 自營商近3日買超"):
             inst_conditions.append("自營商買超")
-        
+
         if st.checkbox("✅ 三大法人同步買超"):
             inst_conditions.append("三法人買超")
-        
+
         if st.checkbox("✅ 融資減、融券減"):
             inst_conditions.append("融資券雙降")
-    
+
     st.markdown("---")
-    
+
     # 股票池選擇
-    col1, col2, col3 = st.columns(3)
-    
+    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
+
     with col1:
         stock_pool = st.selectbox(
             "選擇股票池",
-            ["台灣50成分股", "電子股", "金融股", "傳產股", "自訂清單"]
+            ["台灣50成分股", "電子股", "金融股", "傳產股", "美股科技股", "美股道瓊30", "自訂清單"]
         )
-    
+
     with col2:
-        min_score = st.slider("最低總分", -5, 20, 3)
-    
+        logic_mode = st.radio("條件邏輯", ["任一符合 (OR)", "全部符合 (AND)"], index=0)
+
     with col3:
+        min_score = st.slider("最低總分", -10, 20, -5)
+
+    with col4:
         st.write("")
         st.write("")
         search_btn = st.button("🔍 開始搜尋", type="primary", use_container_width=True)
-    
+
     # 自訂清單
     if stock_pool == "自訂清單":
         custom_stocks = st.text_area(
-            "輸入股票代號 (每行一個)",
-            value="2330\n2317\n2454\n3008\n2308",
+            "輸入股票代號 (每行一個;台股數字 / 美股英文如 AAPL)",
+            value="2330\n2317\n2454\nAAPL\nNVDA",
             height=100
         )
     
@@ -821,13 +866,27 @@ with tab2:
         elif stock_pool == "傳產股":
             stock_list = ["1301", "1303", "2002", "2207", "2408", "2409", "2912", "5880", "6505", "9904",
                           "1101", "1102", "1216", "2105", "2201", "2301", "2395", "2412", "9910", "1326"]
+        elif stock_pool == "美股科技股":
+            stock_list = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AVGO", "ORCL", "CRM",
+                          "AMD", "ADBE", "NFLX", "INTC", "QCOM", "CSCO", "IBM", "TXN", "NOW", "PLTR"]
+        elif stock_pool == "美股道瓊30":
+            stock_list = ["AAPL", "MSFT", "JPM", "V", "JNJ", "WMT", "PG", "UNH", "HD", "MA",
+                          "CVX", "KO", "MRK", "AXP", "MCD", "CSCO", "CAT", "IBM", "CRM", "GS",
+                          "VZ", "HON", "AMGN", "DIS", "NKE", "BA", "MMM", "TRV", "DOW", "WBA"]
         else:
             stock_list = [s.strip() for s in custom_stocks.split('\n') if s.strip()]
-        
+
         # 檢查是否有選擇條件
-        has_conditions = len(tech_conditions) > 0 or len(inst_conditions) > 0
-        
-        st.info(f"搜尋中... 股票池: {len(stock_list)}檔 | 條件: {'至少符合1項' if has_conditions else '無條件限制'}")
+        has_conditions = len(tech_conditions) + len(fund_conditions) + len(inst_conditions) > 0
+        use_and = logic_mode.startswith("全部")
+
+        need_fundamental = len(fund_conditions) > 0
+        fund_note = " + 載入財報" if need_fundamental else ""
+        logic_text = "全部符合" if use_and else "任一符合"
+        st.info(
+            f"搜尋中... 股票池: {len(stock_list)}檔 | "
+            f"條件: {logic_text if has_conditions else '無條件限制'}{fund_note}"
+        )
         
         results = []
         progress = st.progress(0)
@@ -838,107 +897,128 @@ with tab2:
             progress.progress((i + 1) / len(stock_list))
             
             try:
-                df, stock, _ = get_stock_data(code, period="3mo")
+                df, stock, ticker_used = get_stock_data(code, period="3mo")
                 if df is None or len(df) < 60:
                     continue
-                
+
                 df = calc_indicators(df)
                 inst_df = get_institutional_data(code)
-                
+
                 tech_signals, tech_score = analyze_technical(df)
                 inst_signals, inst_score = analyze_institutional(inst_df)
                 recommendation, action, total_score = get_final_recommendation(tech_score, inst_score)
-                
-                if total_score < min_score:
-                    continue
-                
-                # 如果沒有選擇任何條件,顯示所有達到最低分數的股票
+
+                latest = df.iloc[-1]
+
+                # 逐一檢查所有條件,記錄是否滿足
+                condition_results = []  # [(cond_label, passed)]
+
+                # --- 技術面條件 ---
+                if "多頭排列" in tech_conditions:
+                    passed = '均線' in tech_signals and tech_signals['均線'][0] == '多頭排列'
+                    condition_results.append(("多頭排列", passed))
+                if "MA黃金交叉" in tech_conditions:
+                    condition_results.append(("MA黃金交叉", 'MA交叉' in tech_signals))
+                if "MACD紅柱" in tech_conditions:
+                    passed = 'MACD' in tech_signals and tech_signals['MACD'][1] == 'BUY'
+                    condition_results.append(("MACD紅柱", passed))
+                if "RSI超賣" in tech_conditions:
+                    passed = 'RSI' in tech_signals and tech_signals['RSI'][0] == '超賣'
+                    condition_results.append(("RSI超賣", passed))
+                if "KD低檔" in tech_conditions:
+                    passed = 'KD' in tech_signals and tech_signals['KD'][0] == '超賣'
+                    condition_results.append(("KD低檔", passed))
+                if "放量" in tech_conditions:
+                    passed = '成交量' in tech_signals and '上漲' in tech_signals['成交量'][0]
+                    condition_results.append(("放量上漲", passed))
+                if "站上MA20" in tech_conditions:
+                    condition_results.append(("站上MA20", latest['Close'] > latest['MA20']))
+
+                # --- 籌碼面條件 (模擬數據,僅示意) ---
+                if "外資買超" in inst_conditions:
+                    passed = '外資' in inst_signals and inst_signals['外資'][1] == 'BUY'
+                    condition_results.append(("外資買超*", passed))
+                if "投信買超" in inst_conditions:
+                    passed = '投信' in inst_signals and inst_signals['投信'][1] == 'BUY'
+                    condition_results.append(("投信買超*", passed))
+                if "自營商買超" in inst_conditions:
+                    passed = '自營商' in inst_signals and inst_signals['自營商'][1] == 'BUY'
+                    condition_results.append(("自營商買超*", passed))
+                if "三法人買超" in inst_conditions:
+                    passed = ('外資' in inst_signals and inst_signals['外資'][1] == 'BUY' and
+                              '投信' in inst_signals and inst_signals['投信'][1] == 'BUY' and
+                              '自營商' in inst_signals and inst_signals['自營商'][1] == 'BUY')
+                    condition_results.append(("三法人買超*", passed))
+                if "融資券雙降" in inst_conditions:
+                    passed = '融資券' in inst_signals and '雙降' in inst_signals['融資券'][0]
+                    condition_results.append(("融資券雙降*", passed))
+
+                # --- 基本面條件 (真實財報資料) ---
+                fund_data = None
+                fund_eval_type = None
+                if need_fundamental:
+                    fund_data = get_fundamental_data(ticker_used)
+                    # 估值判斷需要 PE 區間
+                    if fund_data and any(c[0] == "估值" for c in fund_conditions):
+                        eps = fund_data.get('每股盈餘', 0)
+                        if eps and eps > 0:
+                            pe_stats = calculate_pe_range(ticker_used, eps)
+                            if pe_stats:
+                                optimistic = eps * pe_stats['最高本益比']
+                                fair = eps * pe_stats['平均本益比']
+                                pessimistic = eps * pe_stats['最低本益比']
+                                _, fund_eval_type, _ = evaluate_stock_valuation(
+                                    latest['Close'], optimistic, fair, pessimistic
+                                )
+
+                for cond, threshold in fund_conditions:
+                    if fund_data is None:
+                        condition_results.append((f"{cond}(無財報)", False))
+                        continue
+                    if cond == "EPS_positive":
+                        condition_results.append(("EPS>0", fund_data.get('每股盈餘', 0) > 0))
+                    elif cond == "ROE":
+                        condition_results.append((f"ROE≥{threshold:.0f}%", fund_data.get('ROE', 0) >= threshold))
+                    elif cond == "毛利率":
+                        condition_results.append((f"毛利率≥{threshold:.0f}%", fund_data.get('毛利率', 0) >= threshold))
+                    elif cond == "淨利率":
+                        condition_results.append((f"淨利率≥{threshold:.0f}%", fund_data.get('淨利率', 0) >= threshold))
+                    elif cond == "股價淨值比_max":
+                        pb_val = fund_data.get('股價淨值比', 0)
+                        condition_results.append(
+                            (f"P/B≤{threshold:.1f}", pb_val > 0 and pb_val <= threshold)
+                        )
+                    elif cond == "股息殖利率":
+                        condition_results.append((f"股息≥{threshold:.1f}%", fund_data.get('股息殖利率', 0) >= threshold))
+                    elif cond == "營收年增率":
+                        condition_results.append(("營收年增>0", fund_data.get('營收年增率', 0) > 0))
+                    elif cond == "估值":
+                        condition_results.append(("估值=便宜/合理", fund_eval_type in ("cheap", "fair")))
+
+                # 綜合判斷 (AND 或 OR)
                 if not has_conditions:
                     match = True
+                    matched_conditions = ["(無條件,僅分數過濾)"]
+                elif use_and:
+                    match = len(condition_results) > 0 and all(p for _, p in condition_results)
+                    matched_conditions = [lbl for lbl, p in condition_results if p]
                 else:
-                    # 改為:只要符合任一條件就算通過 (OR邏輯)
+                    match = any(p for _, p in condition_results)
+                    matched_conditions = [lbl for lbl, p in condition_results if p]
+
+                # 套用最低總分過濾
+                if match and total_score < min_score:
                     match = False
-                    matched_conditions = []
-                    
-                    latest = df.iloc[-1]
-                    prev = df.iloc[-2]
-                    
-                    # 技術面條件檢查 - 任一符合即可
-                    if "多頭排列" in tech_conditions:
-                        if '均線' in tech_signals and tech_signals['均線'][0] == '多頭排列':
-                            match = True
-                            matched_conditions.append("多頭排列")
-                    
-                    if "MA黃金交叉" in tech_conditions:
-                        if 'MA交叉' in tech_signals:
-                            match = True
-                            matched_conditions.append("MA黃金交叉")
-                    
-                    if "MACD紅柱" in tech_conditions:
-                        if 'MACD' in tech_signals and tech_signals['MACD'][1] == 'BUY':
-                            match = True
-                            matched_conditions.append("MACD紅柱")
-                    
-                    if "RSI超賣" in tech_conditions:
-                        if 'RSI' in tech_signals and tech_signals['RSI'][0] == '超賣':
-                            match = True
-                            matched_conditions.append("RSI超賣")
-                    
-                    if "KD低檔" in tech_conditions:
-                        if 'KD' in tech_signals and tech_signals['KD'][0] == '超賣':
-                            match = True
-                            matched_conditions.append("KD低檔")
-                    
-                    if "放量" in tech_conditions:
-                        if '成交量' in tech_signals and '上漲' in tech_signals['成交量'][0]:
-                            match = True
-                            matched_conditions.append("放量上漲")
-                    
-                    if "站上MA20" in tech_conditions:
-                        if latest['Close'] > latest['MA20']:
-                            match = True
-                            matched_conditions.append("站上MA20")
-                    
-                    # 籌碼面條件檢查
-                    if "外資買超" in inst_conditions:
-                        if '外資' in inst_signals and inst_signals['外資'][1] == 'BUY':
-                            match = True
-                            matched_conditions.append("外資買超")
-                    
-                    if "投信買超" in inst_conditions:
-                        if '投信' in inst_signals and inst_signals['投信'][1] == 'BUY':
-                            match = True
-                            matched_conditions.append("投信買超")
-                    
-                    if "自營商買超" in inst_conditions:
-                        if '自營商' in inst_signals and inst_signals['自營商'][1] == 'BUY':
-                            match = True
-                            matched_conditions.append("自營商買超")
-                    
-                    if "三法人買超" in inst_conditions:
-                        if ('外資' in inst_signals and inst_signals['外資'][1] == 'BUY' and
-                            '投信' in inst_signals and inst_signals['投信'][1] == 'BUY' and
-                            '自營商' in inst_signals and inst_signals['自營商'][1] == 'BUY'):
-                            match = True
-                            matched_conditions.append("三法人買超")
-                    
-                    if "融資券雙降" in inst_conditions:
-                        if '融資券' in inst_signals and '雙降' in inst_signals['融資券'][0]:
-                            match = True
-                            matched_conditions.append("融資券雙降")
-                
+
                 if match:
-                    latest = df.iloc[-1]
-                    
                     try:
                         name = stock.info.get('longName', code)
                     except:
                         name = code
-                    
-                    # 顯示符合的條件
-                    matched_text = ", ".join(matched_conditions) if has_conditions and matched_conditions else "達到分數標準"
-                    
-                    results.append({
+
+                    matched_text = ", ".join(matched_conditions) if matched_conditions else "達到分數標準"
+
+                    row = {
                         '代號': code,
                         '名稱': name,
                         '建議': recommendation,
@@ -947,9 +1027,15 @@ with tab2:
                         '技術分': tech_score,
                         '籌碼分': inst_score,
                         '收盤價': f"${latest['Close']:.2f}",
-                        'RSI': f"{latest['RSI']:.1f}"
-                    })
-            
+                        'RSI': f"{latest['RSI']:.1f}",
+                    }
+                    if fund_data:
+                        row['EPS'] = f"{fund_data.get('每股盈餘', 0):.2f}"
+                        row['ROE%'] = f"{fund_data.get('ROE', 0):.1f}"
+                        row['毛利率%'] = f"{fund_data.get('毛利率', 0):.1f}"
+                        row['P/B'] = f"{fund_data.get('股價淨值比', 0):.2f}"
+                    results.append(row)
+
             except:
                 continue
         
@@ -977,10 +1063,11 @@ with tab2:
 # ==================== Tab 3: 批次掃描 ====================
 with tab3:
     st.subheader("📊 批次快速掃描")
-    
+    st.caption("支援混合輸入: 台股 (2330)、上櫃/興櫃 (6488)、美股 (AAPL)")
+
     stock_input = st.text_area(
         "輸入股票代號 (每行一個)",
-        value="2330\n2317\n2454\n3008\n2308\n2382\n2881\n2412\n2886\n2357",
+        value="2330\n2317\n2454\n3008\n2308\nAAPL\nNVDA\nTSLA",
         height=150
     )
     
