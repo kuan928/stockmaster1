@@ -30,8 +30,16 @@ st.markdown("""
 # ==================== 資料取得 ====================
 
 def get_stock_data(code, period="6mo"):
-    """取得股價資料"""
+    """取得股價資料，並回傳實際使用的 ticker 代號 (.TW 或 .TWO)"""
     try:
+        # 美股或其他市場代號保留原樣
+        if '.' in code or code.isalpha():
+            stock = yf.Ticker(code)
+            df = stock.history(period=period)
+            if not df.empty:
+                return df, stock, code
+            return None, None, None
+
         ticker = f"{code}.TW"
         stock = yf.Ticker(ticker)
         df = stock.history(period=period)
@@ -40,10 +48,10 @@ def get_stock_data(code, period="6mo"):
             stock = yf.Ticker(ticker)
             df = stock.history(period=period)
         if not df.empty:
-            return df, stock
-        return None, None
+            return df, stock, ticker
+        return None, None, None
     except:
-        return None, None
+        return None, None, None
 
 def get_institutional_data(stock_code):
     """取得法人買賣資料 (模擬數據)"""
@@ -69,22 +77,29 @@ def get_institutional_data(stock_code):
 # ==================== 財報分析函數 ====================
 
 def get_fundamental_data(ticker_symbol):
-    """獲取並計算財務指標"""
+    """獲取並計算財務指標 (含毛利率/淨利率/ROE/P/B/股息率/營收年增等)"""
     try:
         ticker = yf.Ticker(ticker_symbol)
-        
+
         income_stmt = ticker.financials
         balance_sheet = ticker.balance_sheet
-        info = ticker.info
-        
-        if income_stmt.empty or balance_sheet.empty:
+        info = ticker.info or {}
+
+        if income_stmt is None or income_stmt.empty or balance_sheet is None or balance_sheet.empty:
             return None
-        
+
         latest_income = income_stmt.iloc[:, 0]
         latest_balance = balance_sheet.iloc[:, 0]
-        
+        prev_income = income_stmt.iloc[:, 1] if income_stmt.shape[1] > 1 else None
+
         metrics = {}
-        
+
+        # 報表日期
+        try:
+            metrics['報表期別'] = str(income_stmt.columns[0])[:10]
+        except:
+            metrics['報表期別'] = 'N/A'
+
         # 1. 毛利率
         try:
             gross_profit = latest_income.get('Gross Profit', 0)
@@ -92,7 +107,7 @@ def get_fundamental_data(ticker_symbol):
             metrics['毛利率'] = (gross_profit / total_revenue * 100) if total_revenue else 0
         except:
             metrics['毛利率'] = 0
-        
+
         # 2. 淨利率
         try:
             net_income = latest_income.get('Net Income', 0)
@@ -100,7 +115,7 @@ def get_fundamental_data(ticker_symbol):
             metrics['淨利率'] = (net_income / total_revenue * 100) if total_revenue else 0
         except:
             metrics['淨利率'] = 0
-        
+
         # 3. 總資產週轉率
         try:
             total_revenue = latest_income.get('Total Revenue', 0)
@@ -108,7 +123,7 @@ def get_fundamental_data(ticker_symbol):
             metrics['總資產週轉率'] = (total_revenue / total_assets) if total_assets else 0
         except:
             metrics['總資產週轉率'] = 0
-        
+
         # 4. 權益乘數
         try:
             total_assets = latest_balance.get('Total Assets', 0)
@@ -116,26 +131,28 @@ def get_fundamental_data(ticker_symbol):
             metrics['權益乘數'] = (total_assets / total_equity) if total_equity else 0
         except:
             metrics['權益乘數'] = 0
-        
+
         # 5. 每股淨值
         try:
             total_equity = latest_balance.get('Stockholders Equity', 0)
-            shares_outstanding = info.get('sharesOutstanding', 1)
+            shares_outstanding = info.get('sharesOutstanding') or info.get('impliedSharesOutstanding') or 1
             metrics['每股淨值'] = (total_equity / shares_outstanding) if shares_outstanding else 0
         except:
             metrics['每股淨值'] = 0
-        
-        # 6. 每股盈餘 (EPS)
+
+        # 6. 每股盈餘 (EPS) - 多層 fallback
         try:
             eps = info.get('trailingEps', None)
             if eps is None or eps == 0:
+                eps = info.get('forwardEps', None)
+            if eps is None or eps == 0:
                 net_income = latest_income.get('Net Income', 0)
-                shares_outstanding = info.get('sharesOutstanding', 1)
+                shares_outstanding = info.get('sharesOutstanding') or info.get('impliedSharesOutstanding') or 0
                 eps = (net_income / shares_outstanding) if shares_outstanding else 0
-            metrics['每股盈餘'] = eps
+            metrics['每股盈餘'] = eps if eps is not None else 0
         except:
             metrics['每股盈餘'] = 0
-        
+
         # 7. ROE
         try:
             net_income = latest_income.get('Net Income', 0)
@@ -143,10 +160,46 @@ def get_fundamental_data(ticker_symbol):
             metrics['ROE'] = (net_income / total_equity * 100) if total_equity else 0
         except:
             metrics['ROE'] = 0
-        
+
+        # 8. 股價淨值比 (P/B)
+        try:
+            pb = info.get('priceToBook', None)
+            if pb is None and metrics['每股淨值']:
+                current_price = info.get('currentPrice') or info.get('regularMarketPrice')
+                if current_price:
+                    pb = current_price / metrics['每股淨值']
+            metrics['股價淨值比'] = pb if pb is not None else 0
+        except:
+            metrics['股價淨值比'] = 0
+
+        # 9. 股息殖利率
+        try:
+            dy = info.get('dividendYield', None)
+            # yfinance 有時回傳 0.03 (3%)，有時回傳 3.0；統一處理為 %
+            if dy is not None:
+                metrics['股息殖利率'] = dy * 100 if dy < 1 else dy
+            else:
+                metrics['股息殖利率'] = 0
+        except:
+            metrics['股息殖利率'] = 0
+
+        # 10. 營收年增率 (YoY)
+        try:
+            if prev_income is not None:
+                curr_rev = latest_income.get('Total Revenue', 0)
+                prev_rev = prev_income.get('Total Revenue', 0)
+                if prev_rev:
+                    metrics['營收年增率'] = (curr_rev - prev_rev) / abs(prev_rev) * 100
+                else:
+                    metrics['營收年增率'] = 0
+            else:
+                metrics['營收年增率'] = 0
+        except:
+            metrics['營收年增率'] = 0
+
         return metrics
-        
-    except Exception as e:
+
+    except Exception:
         return None
 
 def calculate_pe_range(ticker_symbol, eps):
@@ -439,8 +492,8 @@ with tab1:
     
     if analyze_btn:
         with st.spinner("分析中..."):
-            df, stock = get_stock_data(stock_code)
-            
+            df, stock, ticker_symbol = get_stock_data(stock_code)
+
             if df is not None and not df.empty:
                 df = calc_indicators(df)
                 inst_df = get_institutional_data(stock_code)
@@ -552,31 +605,43 @@ with tab1:
                 
                 # ==================== 基本面分析 ====================
                 st.subheader("📊 基本面分析與估值")
-                
-                # 組合代號
-                ticker_symbol = f"{stock_code}.TW"
-                
+
                 with st.spinner("載入財報資料..."):
                     fundamental_data = get_fundamental_data(ticker_symbol)
-                
+
                 if fundamental_data and fundamental_data['每股盈餘'] != 0:
+                    report_period = fundamental_data.get('報表期別', 'N/A')
+                    st.caption(f"📅 財報期別: {report_period} | 代號: {ticker_symbol}")
+
                     # 財務指標
                     st.markdown("##### 💼 財務指標 (最新年度)")
-                    
+
                     col1, col2, col3 = st.columns(3)
-                    
+
                     with col1:
                         st.metric("毛利率", f"{fundamental_data['毛利率']:.2f}%")
                         st.metric("淨利率", f"{fundamental_data['淨利率']:.2f}%")
-                    
+
                     with col2:
                         st.metric("總資產週轉率", f"{fundamental_data['總資產週轉率']:.2f}")
                         st.metric("權益乘數", f"{fundamental_data['權益乘數']:.2f}")
-                    
+
                     with col3:
                         st.metric("每股淨值", f"${fundamental_data['每股淨值']:.2f}")
                         st.metric("EPS", f"${fundamental_data['每股盈餘']:.2f}")
-                    
+
+                    # 延伸指標
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        pb = fundamental_data.get('股價淨值比', 0)
+                        st.metric("股價淨值比 (P/B)", f"{pb:.2f}" if pb else "N/A")
+                    with col2:
+                        dy = fundamental_data.get('股息殖利率', 0)
+                        st.metric("股息殖利率", f"{dy:.2f}%" if dy else "N/A")
+                    with col3:
+                        yoy = fundamental_data.get('營收年增率', 0)
+                        st.metric("營收年增率", f"{yoy:+.2f}%" if yoy else "N/A")
+
                     st.info(f"📈 **ROE:** {fundamental_data['ROE']:.2f}%")
                     
                     st.markdown("---")
@@ -773,7 +838,7 @@ with tab2:
             progress.progress((i + 1) / len(stock_list))
             
             try:
-                df, stock = get_stock_data(code, period="3mo")
+                df, stock, _ = get_stock_data(code, period="3mo")
                 if df is None or len(df) < 60:
                     continue
                 
@@ -943,7 +1008,7 @@ with tab3:
             progress.progress((i + 1) / len(stock_list))
             
             try:
-                df, stock = get_stock_data(code, period="3mo")
+                df, stock, _ = get_stock_data(code, period="3mo")
                 if df is None or len(df) < 60:
                     continue
                 
