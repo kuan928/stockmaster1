@@ -30,11 +30,47 @@ st.markdown("""
 # ==================== 資料取得 ====================
 
 def _clean_history(df):
-    """丟掉今天尚未收盤的 NaN Close 列,保留完整交易日。"""
+    """清理歷史資料:去掉 Close 為 NaN 的列 (盤中 yfinance 會回傳半完整列)。"""
     if df is None or df.empty:
         return df
-    df = df.dropna(subset=['Close'])
-    return df
+    return df.dropna(subset=['Close'])
+
+
+def _fetch_history_best(ticker, period="6mo"):
+    """優先用 yf.download (較新、支援明確日期),失敗才回退到 Ticker.history。
+    顯式把 end=明天 以確保包含今天已收盤的資料。
+    """
+    # 把 period 轉成天數
+    days_map = {"1mo": 35, "3mo": 100, "6mo": 200, "1y": 400, "2y": 750}
+    days = days_map.get(period, 200)
+    end = datetime.now() + timedelta(days=1)  # 用 +1 強制包含今天
+    start = end - timedelta(days=days)
+
+    df = None
+    # 方法 1: yf.download (較常取得今日收盤)
+    try:
+        df = yf.download(
+            ticker,
+            start=start.strftime('%Y-%m-%d'),
+            end=end.strftime('%Y-%m-%d'),
+            progress=False,
+            auto_adjust=True,
+            threads=False,
+        )
+        # yf.download 2330 個股仍會回 MultiIndex 欄位,壓平
+        if df is not None and not df.empty and isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+    except Exception:
+        df = None
+
+    # 方法 2: 退回 Ticker.history
+    if df is None or df.empty:
+        try:
+            df = yf.Ticker(ticker).history(period=period, auto_adjust=True)
+        except Exception:
+            df = None
+
+    return _clean_history(df)
 
 
 def get_stock_data(code, period="6mo"):
@@ -46,22 +82,19 @@ def get_stock_data(code, period="6mo"):
 
         # 已含副檔名 (例: 2330.TW, AAPL.US) 或純英文 (美股)
         if '.' in code or not code.replace('-', '').isdigit():
-            stock = yf.Ticker(code)
-            df = _clean_history(stock.history(period=period))
+            df = _fetch_history_best(code, period)
             if df is not None and not df.empty:
-                return df, stock, code
+                return df, yf.Ticker(code), code
             return None, None, None
 
         # 台股: 先試 .TW 再試 .TWO
         ticker = f"{code}.TW"
-        stock = yf.Ticker(ticker)
-        df = _clean_history(stock.history(period=period))
+        df = _fetch_history_best(ticker, period)
         if df is None or df.empty:
             ticker = f"{code}.TWO"
-            stock = yf.Ticker(ticker)
-            df = _clean_history(stock.history(period=period))
+            df = _fetch_history_best(ticker, period)
         if df is not None and not df.empty:
-            return df, stock, ticker
+            return df, yf.Ticker(ticker), ticker
         return None, None, None
     except Exception:
         return None, None, None
@@ -854,21 +887,35 @@ with tab1:
                     """, unsafe_allow_html=True)
                 
                 st.markdown("---")
-                
+
                 # 價格資訊
+                latest_date = latest.name
+                today_date = pd.Timestamp.now(tz=latest_date.tz).normalize() if hasattr(latest_date, 'tz') and latest_date.tz else pd.Timestamp.now().normalize()
+                try:
+                    is_today = latest_date.date() == today_date.date()
+                except Exception:
+                    is_today = False
+                freshness_label = "今日收盤" if is_today else "最新交易日"
+
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
-                    st.metric("💰 收盤價", f"${latest['Close']:.2f}")
+                    st.metric(f"💰 {freshness_label}", f"${latest['Close']:.2f}")
                 with col2:
                     change = latest['Close'] - df.iloc[-2]['Close']
                     change_pct = (change / df.iloc[-2]['Close']) * 100
                     st.metric("📊 漲跌", f"{change:+.2f}", f"{change_pct:+.2f}%")
                 with col3:
-                    vol_ratio = latest['Volume'] / latest['Volume_MA5']
+                    vol_ratio = latest['Volume'] / latest['Volume_MA5'] if latest['Volume_MA5'] else 0
                     st.metric("📈 量能比", f"{vol_ratio:.2f}x")
                 with col4:
-                    st.metric("📅 日期", latest.name.strftime('%m-%d'))
-                
+                    st.metric("📅 資料日期", latest_date.strftime('%Y-%m-%d'))
+
+                if not is_today:
+                    st.caption(
+                        f"ℹ️ 今日 ({datetime.now().strftime('%m-%d')}) 收盤資料 Yahoo Finance 尚未更新 — "
+                        f"顯示最新完整交易日 ({latest_date.strftime('%m-%d')})。台股通常於 15:00 後更新。"
+                    )
+
                 st.markdown("---")
                 
                 # 技術面 + 籌碼面
