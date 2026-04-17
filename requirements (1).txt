@@ -5,3 +5,4 @@ yfinance
 pandas-ta
 matplotlib
 plotly
+python-dateutil
