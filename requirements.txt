@@ -2,6 +2,7 @@ streamlit
 pandas
 numpy
 yfinance
+requests
 matplotlib
 plotly
 python-dateutil

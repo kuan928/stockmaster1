@@ -30,16 +30,21 @@ st.markdown("""
 # ==================== 資料取得 ====================
 
 def get_stock_data(code, period="6mo"):
-    """取得股價資料，並回傳實際使用的 ticker 代號 (.TW 或 .TWO)"""
+    """取得股價資料，並回傳實際使用的 ticker 代號 (.TW 或 .TWO)。"""
     try:
-        # 美股或其他市場代號保留原樣
-        if '.' in code or code.isalpha():
+        code = str(code).strip().upper()
+        if not code:
+            return None, None, None
+
+        # 已含副檔名 (例: 2330.TW, AAPL.US) 或純英文 (美股)
+        if '.' in code or not code.replace('-', '').isdigit():
             stock = yf.Ticker(code)
             df = stock.history(period=period)
             if not df.empty:
                 return df, stock, code
             return None, None, None
 
+        # 台股: 先試 .TW 再試 .TWO
         ticker = f"{code}.TW"
         stock = yf.Ticker(ticker)
         df = stock.history(period=period)
@@ -50,7 +55,7 @@ def get_stock_data(code, period="6mo"):
         if not df.empty:
             return df, stock, ticker
         return None, None, None
-    except:
+    except Exception:
         return None, None, None
 
 def _parse_int(v):
@@ -86,23 +91,41 @@ def _recent_trading_dates(n=5):
     return dates
 
 
+# 最近一次法人資料抓取錯誤 (供 UI 顯示診斷)
+_INSTI_LAST_ERROR = {"value": None}
+
+_HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+}
+
+
 @st.cache_data(ttl=14400, show_spinner=False)
 def _fetch_twse_insti_day(date_ymd):
     """抓 TWSE 某日三大法人 (YYYYMMDD)。回傳 DataFrame 或 None。"""
     try:
         url = "https://www.twse.com.tw/rwd/zh/fund/T86"
         params = {"date": date_ymd, "selectType": "ALL", "response": "json"}
-        r = requests.get(url, params=params, timeout=15,
-                         headers={"User-Agent": "Mozilla/5.0"})
+        headers = dict(_HTTP_HEADERS)
+        headers["Referer"] = "https://www.twse.com.tw/"
+        r = requests.get(url, params=params, timeout=8, headers=headers)
         if r.status_code != 200:
+            _INSTI_LAST_ERROR["value"] = f"TWSE HTTP {r.status_code}"
             return None
         j = r.json()
         if j.get('stat') != 'OK' or not j.get('data'):
+            _INSTI_LAST_ERROR["value"] = f"TWSE stat={j.get('stat','?')} (date={date_ymd}) — 可能為假日"
             return None
         df = pd.DataFrame(j['data'], columns=j['fields'])
         df.columns = [str(c).strip() for c in df.columns]
         return df
-    except Exception:
+    except requests.exceptions.Timeout:
+        _INSTI_LAST_ERROR["value"] = "TWSE 連線逾時 (8秒)"
+        return None
+    except Exception as e:
+        _INSTI_LAST_ERROR["value"] = f"TWSE 錯誤: {type(e).__name__}"
         return None
 
 
@@ -113,9 +136,11 @@ def _fetch_tpex_insti_day(date_roc):
         url = "https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade"
         params = {"type": "Daily", "sect": "AL", "date": date_roc,
                   "id": "", "response": "json"}
-        r = requests.get(url, params=params, timeout=15,
-                         headers={"User-Agent": "Mozilla/5.0"})
+        headers = dict(_HTTP_HEADERS)
+        headers["Referer"] = "https://www.tpex.org.tw/"
+        r = requests.get(url, params=params, timeout=8, headers=headers)
         if r.status_code != 200:
+            _INSTI_LAST_ERROR["value"] = f"TPEX HTTP {r.status_code}"
             return None
         j = r.json()
         tables = j.get('tables') or []
@@ -127,35 +152,13 @@ def _fetch_tpex_insti_day(date_roc):
                 return df
         if j.get('aaData'):
             return pd.DataFrame(j['aaData'])
+        _INSTI_LAST_ERROR["value"] = f"TPEX 回傳無資料 (date={date_roc}) — 可能為假日"
         return None
-    except Exception:
+    except requests.exceptions.Timeout:
+        _INSTI_LAST_ERROR["value"] = "TPEX 連線逾時 (8秒)"
         return None
-
-
-@st.cache_data(ttl=14400, show_spinner=False)
-def _fetch_twse_margin_day(date_ymd):
-    """抓 TWSE 某日融資融券 (YYYYMMDD)。回傳 DataFrame 或 None。"""
-    try:
-        url = "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN"
-        params = {"date": date_ymd, "selectType": "ALL", "response": "json"}
-        r = requests.get(url, params=params, timeout=15,
-                         headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code != 200:
-            return None
-        j = r.json()
-        # 新版回傳 tables[*]; 舊版 creditList
-        tables = j.get('tables') or []
-        for t in tables:
-            fields = t.get('fields') or []
-            data = t.get('data') or []
-            if fields and data and any('股票代號' in str(c) or '證券代號' in str(c) for c in fields):
-                df = pd.DataFrame(data, columns=[str(c).strip() for c in fields])
-                return df
-        cl = j.get('creditList') or {}
-        if cl.get('fields') and cl.get('data'):
-            return pd.DataFrame(cl['data'], columns=[str(c).strip() for c in cl['fields']])
-        return None
-    except Exception:
+    except Exception as e:
+        _INSTI_LAST_ERROR["value"] = f"TPEX 錯誤: {type(e).__name__}"
         return None
 
 
@@ -186,26 +189,26 @@ def _find_col(row, keywords):
     return 0
 
 
-def get_institutional_data(stock_code, is_otc=False, days=5):
-    """取得真實三大法人 + 融資融券資料 (TWSE / TPEX)。
+def get_institutional_data(stock_code, is_otc=False, days=3):
+    """取得真實三大法人資料 (TWSE / TPEX),預設抓近 3 個交易日。
     回傳: DataFrame 含 [日期, 外資買賣, 投信買賣, 自營商買賣, 融資增減, 融券增減] (單位: 張)
           取不到則回傳 None。
     """
-    # 美股/純英文代號不支援
-    if not str(stock_code).strip().isdigit():
+    _INSTI_LAST_ERROR["value"] = None
+    code = str(stock_code).strip()
+    if not code.isdigit():
+        _INSTI_LAST_ERROR["value"] = "非台股代號 (僅台股有法人資料)"
         return None
 
     rows = []
     for dt in _recent_trading_dates(days):
         foreign = trust = dealer = 0
-        margin = short = 0
         found = False
 
         if is_otc:
             df_i = _fetch_tpex_insti_day(_roc_date(dt))
-            row = _match_stock_row(df_i, stock_code) if df_i is not None else None
+            row = _match_stock_row(df_i, code) if df_i is not None else None
             if row is not None:
-                # TPEX 通常以「張」為單位;若是「股數」則以名稱判斷
                 use_shares = any('股數' in str(c) for c in row.index)
                 foreign = _find_col(row, ['外資及陸資', '外陸資', '外資'])
                 trust = _find_col(row, ['投信'])
@@ -217,7 +220,7 @@ def get_institutional_data(stock_code, is_otc=False, days=5):
                 found = True
         else:
             df_i = _fetch_twse_insti_day(dt.strftime('%Y%m%d'))
-            row = _match_stock_row(df_i, stock_code) if df_i is not None else None
+            row = _match_stock_row(df_i, code) if df_i is not None else None
             if row is not None:
                 f1 = _find_col(row, ['外陸資買賣超股數(不含外資自營商)', '外陸資買賣超'])
                 f2 = _find_col(row, ['外資自營商買賣超股數'])
@@ -226,32 +229,27 @@ def get_institutional_data(stock_code, is_otc=False, days=5):
                 dealer = _find_col(row, ['自營商買賣超股數', '自營商買賣超']) // 1000
                 found = True
 
-            # 融資融券 (只上市有)
-            df_m = _fetch_twse_margin_day(dt.strftime('%Y%m%d'))
-            mrow = _match_stock_row(df_m, stock_code) if df_m is not None else None
-            if mrow is not None:
-                m_today = _find_col(mrow, ['融資今日餘額', '今日餘額'])
-                m_prev = _find_col(mrow, ['融資前日餘額', '前日餘額'])
-                margin = m_today - m_prev if (m_today or m_prev) else 0
-                # 融券:欄位位置通常在融資之後,使用關鍵字差異
-                s_today = _find_col(mrow, ['融券今日餘額'])
-                s_prev = _find_col(mrow, ['融券前日餘額'])
-                short = s_today - s_prev if (s_today or s_prev) else 0
-
         if found:
             rows.append({
                 '日期': dt,
                 '外資買賣': foreign,
                 '投信買賣': trust,
                 '自營商買賣': dealer,
-                '融資增減': margin,
-                '融券增減': short,
+                '融資增減': 0,
+                '融券增減': 0,
             })
 
     if not rows:
+        if _INSTI_LAST_ERROR["value"] is None:
+            _INSTI_LAST_ERROR["value"] = f"找不到 {code} 的法人資料 (可能非當前可查詢範圍)"
         return None
     out = pd.DataFrame(rows).sort_values('日期').reset_index(drop=True)
     return out
+
+
+def get_insti_last_error():
+    """取得最近一次法人資料抓取失敗原因 (供 UI 顯示)。"""
+    return _INSTI_LAST_ERROR.get("value")
 
 # ==================== 財報分析函數 ====================
 
@@ -311,11 +309,11 @@ def get_fundamental_data(ticker_symbol):
         except:
             metrics['權益乘數'] = 0
 
-        # 5. 每股淨值
+        # 5. 每股淨值 (BVPS)
         try:
             total_equity = latest_balance.get('Stockholders Equity', 0)
-            shares_outstanding = info.get('sharesOutstanding') or info.get('impliedSharesOutstanding') or 1
-            metrics['每股淨值'] = (total_equity / shares_outstanding) if shares_outstanding else 0
+            shares_outstanding = info.get('sharesOutstanding') or info.get('impliedSharesOutstanding') or 0
+            metrics['每股淨值'] = (total_equity / shares_outstanding) if shares_outstanding > 0 else 0
         except:
             metrics['每股淨值'] = 0
 
@@ -655,6 +653,49 @@ def get_final_recommendation(tech_score, inst_score):
 st.title("📊 台股智能分析系統")
 st.markdown("**技術面 × 籌碼面 × 基本面 × 智能篩選**")
 
+# 側邊欄: 資料源連線診斷
+with st.sidebar:
+    st.markdown("### 🔧 系統診斷")
+    st.caption("若查詢時無法取得資料,可點下方按鈕確認各資料源是否能連線。")
+    if st.button("🩺 測試資料源連線"):
+        diag_results = []
+        # yfinance
+        try:
+            import time as _time
+            t0 = _time.time()
+            _probe = yf.Ticker("2330.TW").history(period="5d")
+            ok = not _probe.empty
+            diag_results.append(("yfinance (股價/財報)", ok, f"{_time.time()-t0:.1f}s"))
+        except Exception as e:
+            diag_results.append(("yfinance (股價/財報)", False, type(e).__name__))
+        # TWSE
+        try:
+            import time as _time
+            t0 = _time.time()
+            r = requests.get("https://www.twse.com.tw/rwd/zh/fund/T86",
+                             params={"date": "20250415", "selectType": "ALL", "response": "json"},
+                             headers=_HTTP_HEADERS, timeout=8)
+            diag_results.append(("TWSE (上市法人)", r.status_code == 200, f"HTTP {r.status_code} ({_time.time()-t0:.1f}s)"))
+        except Exception as e:
+            diag_results.append(("TWSE (上市法人)", False, type(e).__name__))
+        # TPEX
+        try:
+            import time as _time
+            t0 = _time.time()
+            r = requests.get("https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade",
+                             params={"type": "Daily", "sect": "AL", "date": "114/04/15",
+                                     "id": "", "response": "json"},
+                             headers=_HTTP_HEADERS, timeout=8)
+            diag_results.append(("TPEX (上櫃法人)", r.status_code == 200, f"HTTP {r.status_code} ({_time.time()-t0:.1f}s)"))
+        except Exception as e:
+            diag_results.append(("TPEX (上櫃法人)", False, type(e).__name__))
+
+        for name, ok, detail in diag_results:
+            if ok:
+                st.success(f"✅ {name}: {detail}")
+            else:
+                st.error(f"❌ {name}: {detail}")
+
 tab1, tab2, tab3 = st.tabs(["🔍 單股分析", "🎯 智能選股", "📊 批次掃描"])
 
 # ==================== Tab 1: 單股完整分析 ====================
@@ -676,6 +717,7 @@ with tab1:
     st.caption("💡 支援市場: 台股上市(.TW)、上櫃/興櫃(.TWO)、美股 (直接輸入英文代號如 AAPL)")
     
     if analyze_btn:
+        stock_code = str(stock_code).strip().upper()
         with st.spinner("分析中..."):
             df, stock, ticker_symbol = get_stock_data(stock_code)
 
@@ -793,7 +835,9 @@ with tab1:
                         )
                     else:
                         if str(stock_code).strip().isdigit():
-                            st.warning("⚠️ 無法取得真實籌碼資料 (TWSE/TPEX 可能暫時無回應或假日)")
+                            err = get_insti_last_error() or "未知原因"
+                            st.warning(f"⚠️ 無法取得真實籌碼資料\n\n原因: {err}")
+                            st.caption("💡 若為假日或剛開盤,TWSE 資料通常於 15:00 後公布。若持續失敗,可能是雲端伺服器無法存取 TWSE,請告知以改用其他資料源。")
                         else:
                             st.info("ℹ️ 美股/非台股不提供籌碼面分析")
                 
