@@ -36,6 +36,168 @@ def _clean_history(df):
     return df.dropna(subset=['Close'])
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_twse_stock_month(stock_code, yyyymm):
+    """抓 TWSE 個股某月日成交資料 (權威來源,含今日)。回傳 DataFrame 或 None。"""
+    try:
+        url = "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY"
+        params = {"stockNo": stock_code, "date": f"{yyyymm}01", "response": "json"}
+        headers = dict(_HTTP_HEADERS)
+        headers["Referer"] = "https://www.twse.com.tw/"
+        r = requests.get(url, params=params, timeout=8, headers=headers)
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        rows_raw = j.get('data') or []
+        if not rows_raw:
+            return None
+
+        def _f(x):
+            s = str(x).replace(',', '').strip()
+            try:
+                return float(s) if s not in ('', '-', '--', 'X') else None
+            except Exception:
+                return None
+
+        rows = []
+        for row in rows_raw:
+            try:
+                parts = str(row[0]).split('/')
+                if len(parts) != 3:
+                    continue
+                dt = datetime(int(parts[0]) + 1911, int(parts[1]), int(parts[2]))
+                volume = _parse_int(row[1])  # 股數
+                open_p = _f(row[3])
+                high = _f(row[4])
+                low = _f(row[5])
+                close = _f(row[6])
+                if close is None:
+                    continue
+                rows.append({
+                    'Date': dt,
+                    'Open': open_p if open_p is not None else close,
+                    'High': high if high is not None else close,
+                    'Low': low if low is not None else close,
+                    'Close': close,
+                    'Volume': volume,
+                })
+            except Exception:
+                continue
+        if not rows:
+            return None
+        return pd.DataFrame(rows).set_index('Date').sort_index()
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_tpex_stock_month(stock_code, yyyymm):
+    """抓 TPEX 上櫃個股某月日成交資料。回傳 DataFrame 或 None。"""
+    try:
+        # TPEX 月份參數是 ROC 年/月: 114/04
+        year = int(yyyymm[:4]) - 1911
+        month = int(yyyymm[4:6])
+        roc_date = f"{year}/{month:02d}"
+        url = "https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock"
+        params = {"code": stock_code, "date": roc_date, "id": "", "response": "json"}
+        headers = dict(_HTTP_HEADERS)
+        headers["Referer"] = "https://www.tpex.org.tw/"
+        r = requests.get(url, params=params, timeout=8, headers=headers)
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        df_raw = _df_from_any(j)
+        if df_raw is None or df_raw.empty:
+            return None
+
+        def _f(x):
+            s = str(x).replace(',', '').strip()
+            try:
+                return float(s) if s not in ('', '-', '--', 'X') else None
+            except Exception:
+                return None
+
+        rows = []
+        cols = list(df_raw.columns)
+        for _, row in df_raw.iterrows():
+            try:
+                date_str = str(row[cols[0]])
+                parts = date_str.split('/')
+                if len(parts) != 3:
+                    continue
+                dt = datetime(int(parts[0]) + 1911, int(parts[1]), int(parts[2]))
+                # TPEX 欄位順序: 日期, 成交仟股, 成交仟元, 開盤, 最高, 最低, 收盤, 漲跌, 筆數
+                volume = _parse_int(row[cols[1]]) * 1000 if len(cols) > 1 else 0
+                open_p = _f(row[cols[3]]) if len(cols) > 3 else None
+                high = _f(row[cols[4]]) if len(cols) > 4 else None
+                low = _f(row[cols[5]]) if len(cols) > 5 else None
+                close = _f(row[cols[6]]) if len(cols) > 6 else None
+                if close is None:
+                    continue
+                rows.append({
+                    'Date': dt, 'Open': open_p if open_p is not None else close,
+                    'High': high if high is not None else close,
+                    'Low': low if low is not None else close,
+                    'Close': close, 'Volume': volume,
+                })
+            except Exception:
+                continue
+        if not rows:
+            return None
+        return pd.DataFrame(rows).set_index('Date').sort_index()
+    except Exception:
+        return None
+
+
+def _merge_with_twse(df, ticker):
+    """若 yfinance 資料落後超過 1 天,用 TWSE/TPEX 補上最新日。"""
+    if not ticker.endswith(('.TW', '.TWO')):
+        return df
+    stock_code = ticker.replace('.TW', '').replace('.TWO', '')
+
+    # 計算 yfinance 最新日期與今日差距
+    try:
+        today = datetime.now().date()
+        if df is not None and not df.empty:
+            last = df.index[-1]
+            last_date = last.date() if hasattr(last, 'date') else pd.Timestamp(last).date()
+        else:
+            last_date = today - timedelta(days=365)
+    except Exception:
+        return df
+
+    # 只有當資料落後 >= 1 天才嘗試 TWSE 補強 (台股 vs 週末也算)
+    if (today - last_date).days < 1:
+        return df
+
+    # 抓本月 (+ 上個月以防月初)
+    fetcher = _fetch_twse_stock_month if ticker.endswith('.TW') else _fetch_tpex_stock_month
+    now = datetime.now()
+    last_month = (now.replace(day=1) - timedelta(days=1))
+    for month_dt in [now, last_month]:
+        try:
+            supp = fetcher(stock_code, month_dt.strftime('%Y%m'))
+            if supp is None or supp.empty:
+                continue
+            # 對齊 timezone
+            if df is not None and not df.empty and df.index.tz is not None:
+                supp.index = pd.to_datetime(supp.index).tz_localize(df.index.tz)
+            else:
+                supp.index = pd.to_datetime(supp.index)
+            if df is None or df.empty:
+                df = supp
+            else:
+                # 對齊 timezone 後合併,重複以 TWSE 為準 (更新鮮)
+                if df.index.tz is None and supp.index.tz is not None:
+                    df.index = pd.to_datetime(df.index).tz_localize(supp.index.tz)
+                df = pd.concat([df, supp])
+                df = df[~df.index.duplicated(keep='last')].sort_index()
+        except Exception:
+            continue
+
+    return df
+
+
 def _fetch_history_best(ticker, period="6mo"):
     """優先用 yf.download (較新、支援明確日期),失敗才回退到 Ticker.history。
     顯式把 end=明天 以確保包含今天已收盤的資料。
@@ -70,7 +232,12 @@ def _fetch_history_best(ticker, period="6mo"):
         except Exception:
             df = None
 
-    return _clean_history(df)
+    df = _clean_history(df)
+
+    # 方法 3: 台股若資料落後超過 1 天,用 TWSE/TPEX 補上最新日
+    df = _merge_with_twse(df, ticker)
+
+    return df
 
 
 def get_stock_data(code, period="6mo"):
