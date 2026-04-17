@@ -1,8 +1,0 @@
-streamlit
-pandas
-numpy
-yfinance
-pandas-ta
-matplotlib
-plotly
-
